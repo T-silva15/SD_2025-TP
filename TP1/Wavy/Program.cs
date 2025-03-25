@@ -23,17 +23,17 @@ public class Wavy
 
                 while (true)
                 {
-                    SendSensorData(stream, "Frequency", GenerateTemp(108, 0));
-                    Thread.Sleep(10000);
+					SendSensorData(stream, "Temperature", GenerateTemp(40, 0));
+					Thread.Sleep(60000);
+
+					SendSensorData(stream, "WindSpeed", GenerateTemp(300, 0));
+					Thread.Sleep(30000);
+
+					SendSensorData(stream, "Frequency", GenerateTemp(108, 0));
+                    Thread.Sleep(20000);
 
                     SendSensorData(stream, "Decibels", GenerateTemp(150, 0));
                     Thread.Sleep(10000);
-
-                    SendSensorData(stream, "WindSpeed", GenerateTemp(300, 0));
-                    Thread.Sleep(10000);
-
-                    SendSensorData(stream, "Temperature", GenerateTemp(40, 0));
-                    Thread.Sleep(30000);
                 }
             }
         }

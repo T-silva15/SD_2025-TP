@@ -11,28 +11,24 @@ using System.Threading;
 /// <summary>
 /// Aggregator class responsible for collecting data from Wavy clients,
 /// aggregating it by data types, and periodically sending the combined data to a server.
-/// Implements communication protocols with specific codes for connection, data transfer, and confirmation.
+/// <para>Implements communication protocols with specific codes for connection, data transfer, and confirmation.</para>
 /// </summary>
 class Aggregator
 {
 	// Dictionary to store data received from Wavy clients, organized by data type
 	private static readonly ConcurrentDictionary<string, ConcurrentBag<string>> dataStore = new ConcurrentDictionary<string, ConcurrentBag<string>>();
 
-	// Track when data was last sent to the server for each data type
-	//private static readonly ConcurrentDictionary<string, DateTime> lastSentTime = new ConcurrentDictionary<string, DateTime>();
-
 	// Network configuration
 	private static readonly int port = 5000;                 // Port for listening to Wavy connections
 	private static readonly string serverIp = "127.0.0.1";   // IP address of the server
 	private static readonly int serverPort = 6000;           // Port for server connections
 
-	// Unique ID for this aggregator instance
+	// Unique identifier for this aggregator instance
 	private static readonly string aggregatorId = Guid.NewGuid().ToString();
 
 	/// <summary>
 	/// Entry point for the Aggregator application.
-	/// Starts two threads: one for listening to incoming Wavy connections
-	/// and another for periodically sending aggregated data to the server.
+	/// <para>Starts two threads: one for listening to incoming Wavy connections and another for periodically sending aggregated data to the server.</para>
 	/// </summary>
 	/// <param name="args">Command line arguments (not used)</param>
 	public static void Main(string[] args)
@@ -46,10 +42,10 @@ class Aggregator
 
 	/// <summary>
 	/// Listens for incoming connections from Wavy clients.
-	/// Processes different message codes:
-	/// - 101: Wavy connection
-	/// - 201: Data received from Wavy
-	/// - 501: Wavy disconnection
+	/// <para>Processes different message codes:</para>
+	/// <para>101: Wavy connection</para>
+	/// <para>201: Data received from Wavy</para>
+	/// <para>501: Wavy disconnection</para>
 	/// </summary>
 	private static void StartListener()
 	{
@@ -106,11 +102,11 @@ class Aggregator
 
 	/// <summary>
 	/// Periodically sends aggregated data to the server.
-	/// - Runs every hour
-	/// - Aggregates data by data type
-	/// - Sends data using code 301
-	/// - Waits for confirmation (code 402)
-	/// - Resends if confirmation not received
+	/// <para>Runs every hour</para>
+	/// <para>Aggregates data by data type</para>
+	/// <para>Sends data using code 301</para>
+	/// <para>Waits for confirmation (code 402)</para>
+	/// <para>Resends if confirmation not received</para>
 	/// </summary>
 	private static void SendDataToServer()
 	{
@@ -191,7 +187,7 @@ class Aggregator
 
 	/// <summary>
 	/// Sends a message with the specified code to the provided network stream.
-	/// The message format is: [4-byte code][message content]
+	/// <para>The message format is: [4-byte code][message content]</para>
 	/// </summary>
 	/// <param name="stream">The network stream to send the message to</param>
 	/// <param name="message">The message content to send</param>
@@ -215,7 +211,7 @@ class Aggregator
 
 	/// <summary>
 	/// Sends a confirmation message with the specified code.
-	/// Used to acknowledge the receipt of data from Wavy clients.
+	/// <para>Used to acknowledge the receipt of data from Wavy clients.</para>
 	/// </summary>
 	/// <param name="stream">The network stream to send the confirmation to</param>
 	/// <param name="code">The confirmation code (e.g., 401 for Wavy data confirmation)</param>
@@ -243,4 +239,3 @@ class Aggregator
 		return code == expectedCode;
 	}
 }
-
