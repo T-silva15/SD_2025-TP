@@ -89,6 +89,7 @@ class Server
 		Console.WriteLine("Press 'V' to toggle verbose mode");
 		Console.WriteLine("Press 'C' to modify connection string");
 		Console.WriteLine("Press 'I' to check for inactive devices");
+		Console.WriteLine("Press 'W' to clear screen");
 		Console.WriteLine("Press 'Q' to quit");
 
 		// Main server loop
@@ -149,6 +150,9 @@ class Server
 					case ConsoleKey.Q:
 						Console.WriteLine("Shutting down server...");
 						isRunning = false;
+						break;
+					case ConsoleKey.W:
+						ClearScreenAndShowMenu();
 						break;
 				}
 			}
@@ -407,6 +411,22 @@ class Server
 		Console.WriteLine("===============================\n");
 	}
 
+	/// <summary>
+	/// Clears the console screen and displays the menu again
+	/// </summary>
+	static void ClearScreenAndShowMenu()
+	{
+		Console.Clear();
+		Console.WriteLine($"[SERVER] Listening on port {PORT}...");
+		Console.WriteLine("\nAvailable Commands:");
+		Console.WriteLine("Press 'A' to show connected aggregators");
+		Console.WriteLine("Press 'D' to show database statistics");
+		Console.WriteLine("Press 'V' to toggle verbose mode");
+		Console.WriteLine("Press 'C' to modify connection string");
+		Console.WriteLine("Press 'I' to check for inactive devices");
+		Console.WriteLine("Press 'W' to clear screen");
+		Console.WriteLine("Press 'Q' to quit");
+	}
 
 	#endregion
 
@@ -618,10 +638,10 @@ class Server
 
 							// Update or insert Aggregator record
 							string updateAggregator = @"
-                            IF EXISTS (SELECT 1 FROM Aggregators WHERE AggregatorID = @id)
-                                UPDATE Aggregators SET LastSeen = @ts, Status = 'Active' WHERE AggregatorID = @id
-                            ELSE
-                                INSERT INTO Aggregators (AggregatorID, LastSeen, Status) VALUES (@id, @ts, 'Active')";
+							IF EXISTS (SELECT 1 FROM Aggregators WHERE AggregatorID = @id)
+								UPDATE Aggregators SET LastSeen = @ts WHERE AggregatorID = @id
+							ELSE
+								INSERT INTO Aggregators (AggregatorID, LastSeen) VALUES (@id, @ts)";
 
 							using (var cmd = new SqlCommand(updateAggregator, connection, transaction))
 							{
@@ -695,6 +715,7 @@ class Server
 			}
 		}
 	}
+
 
 	/// <summary>
 	/// Helper method to process a measurement and insert it into the database.

@@ -60,7 +60,7 @@ public class Wavy
 		public static int DecibelsIntervalMs { get; private set; } = 1000;
 
 		// Debug settings
-		public static bool VerboseMode { get; set; } = true;
+		public static bool VerboseMode { get; set; } = false;
 
 		// File path for configuration
 		public static readonly string ConfigFilePath = "wavy.config.json";
@@ -238,6 +238,7 @@ public class Wavy
 		Console.WriteLine("Press 'V' to toggle verbose mode");
 		Console.WriteLine("Press 'T' to show active threads");
 		Console.WriteLine("Press 'S' to save current configuration");
+		Console.WriteLine("Press 'W' to clear screen");
 		Console.WriteLine("Press 'Q' to quit");
 
 		// Start keyboard monitoring thread
@@ -441,6 +442,9 @@ public class Wavy
 							Thread.Sleep(500); // Give time for message to display
 							Environment.Exit(0);
 							break;
+						case ConsoleKey.W:
+							ClearScreenAndShowMenu();
+							break;
 					}
 				}
 				Thread.Sleep(100);
@@ -480,6 +484,24 @@ public class Wavy
 			}
 		}
 		Console.WriteLine("===================\n");
+	}
+
+	/// <summary>
+	/// Clears the console screen and displays the menu again
+	/// </summary>
+	static void ClearScreenAndShowMenu()
+	{
+		Console.Clear();
+		Console.WriteLine($"Wavy client starting (ID: {wavyId})");
+		Console.WriteLine($"Mode: {(Config.UseHttpLikeMode ? "HTTP-like" : "Continuous connection")}");
+		Console.WriteLine($"Connecting to Aggregator at {Config.AggregatorIp}:{Config.AggregatorPort}");
+		Console.WriteLine("\nAvailable Commands:");
+		Console.WriteLine("Press 'M' to toggle connection mode");
+		Console.WriteLine("Press 'V' to toggle verbose mode");
+		Console.WriteLine("Press 'T' to show active threads");
+		Console.WriteLine("Press 'S' to save current configuration");
+		Console.WriteLine("Press 'W' to clear screen");
+		Console.WriteLine("Press 'Q' to quit");
 	}
 
 	#endregion

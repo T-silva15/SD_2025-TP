@@ -63,7 +63,7 @@ class Aggregator
 		public static int ReceiveBufferSize { get; private set; } = 4096;
 
 		// Debug settings
-		public static bool DefaultVerboseMode { get; private set; } = true;
+		public static bool DefaultVerboseMode { get; private set; } = false;
 
 		// File path for configuration
 		private static readonly string ConfigFilePath = "aggregator.config.json";
@@ -215,6 +215,7 @@ class Aggregator
 		Console.WriteLine("Press 'T' to show active threads");
 		Console.WriteLine("Press 'S' to save current configuration");
 		Console.WriteLine("Press 'X' to delete configuration file");
+		Console.WriteLine("Press 'W' to clear screen");
 		Console.WriteLine("Press 'Q' to quit");
 
 
@@ -341,6 +342,9 @@ class Aggregator
 							Thread.Sleep(500); // Give time for message to display
 							Environment.Exit(0);
 							break;
+						case ConsoleKey.W:
+							ClearScreenAndShowMenu();
+							break;
 					}
 				}
 				Thread.Sleep(Config.ClientPollIntervalMs);
@@ -442,6 +446,25 @@ class Aggregator
 		Console.WriteLine("===================\n");
 	}
 
+	/// <summary>
+	/// Clears the console screen and displays the menu again
+	/// </summary>
+	static void ClearScreenAndShowMenu()
+	{
+		Console.Clear();
+		Console.WriteLine($"Aggregator {aggregatorId} starting in debug mode...");
+		Console.WriteLine($"Listening on port {Config.ListeningPort}, sending to {Config.ServerIp}:{Config.ServerPort}");
+		Console.WriteLine("\nAvailable Commands:");
+		Console.WriteLine("Press 'V' to toggle verbose mode");
+		Console.WriteLine("Press 'C' to show currently connected Wavy clients");
+		Console.WriteLine("Press 'D' to show current data store");
+		Console.WriteLine("Press 'T' to show active threads");
+		Console.WriteLine("Press 'S' to save current configuration");
+		Console.WriteLine("Press 'X' to delete configuration file");
+		Console.WriteLine("Press 'W' to clear screen");
+		Console.WriteLine("Press 'Q' to quit");
+	}
+
 	#endregion
 
 	#region Network Listener and Client Handling
@@ -515,12 +538,20 @@ class Aggregator
 			using (client)
 			using (NetworkStream stream = client.GetStream())
 			{
+				// For HTTP-like mode, we should process just one request and then exit
+				bool isHttpLikeRequest = false;
+
 				while (client.Connected && isRunning)
 				{
 					// If no data available, wait a bit and try again
 					if (!stream.DataAvailable)
 					{
 						Thread.Sleep(Config.ClientPollIntervalMs);
+
+						// If we're handling an HTTP-like request and we've already processed it, exit the loop
+						if (isHttpLikeRequest)
+							break;
+
 						continue;
 					}
 
@@ -534,6 +565,10 @@ class Aggregator
 					int messageCode = BitConverter.ToInt32(buffer, 0);
 
 					Console.WriteLine($"\n[{DateTime.Now:HH:mm:ss.fff}] Received message with code: {messageCode}");
+
+					// Check if this is an HTTP-like request
+					if (messageCode == MessageCodes.WavyDataHttpInitial)
+						isHttpLikeRequest = true;
 
 					switch (messageCode)
 					{
@@ -550,7 +585,8 @@ class Aggregator
 							break;
 						case MessageCodes.WavyDisconnect:
 							ProcessDisconnection(buffer, bytesRead, stream);
-							break;
+							// If we receive a disconnect request, exit the loop
+							return;
 						default:
 							if (verboseMode)
 							{
@@ -563,6 +599,7 @@ class Aggregator
 
 					// Always send confirmation regardless of what was received
 					SendConfirmation(stream, MessageCodes.WavyConfirmation);
+
 				}
 			}
 		}
@@ -576,6 +613,8 @@ class Aggregator
 			UnregisterThread(Thread.CurrentThread);
 		}
 	}
+
+
 
 	#endregion
 
@@ -747,7 +786,7 @@ class Aggregator
 				// Add the WavyId
 				dataWithWavyId["WavyId"] = wavyId;
 
-				// Serialize to JSON and store
+				// Serialize to JSON and store as string
 				string jsonData = JsonSerializer.Serialize(dataWithWavyId);
 				dataStore[dataType].Add(jsonData);
 			}
@@ -769,7 +808,6 @@ class Aggregator
 			Console.WriteLine($"Error processing data item: {ex.Message}");
 		}
 	}
-
 
 	#endregion
 
@@ -827,15 +865,34 @@ class Aggregator
 
 	private static void SendAggregatedData(ConcurrentDictionary<string, ConcurrentBag<string>> dataToSend)
 	{
-		// Existing aggregation code...
+		// Create a list to hold aggregated data by data type
 		var aggregatedDataList = new List<object>();
 
 		// Aggregate data for each data type
 		foreach (var dataType in dataToSend.Keys)
 		{
-			// Perform aggregation logic here
-			var aggregatedData = dataToSend[dataType].ToList();
-			aggregatedDataList.Add(new { DataType = dataType, Data = aggregatedData });
+			// Parse each JSON string back to objects to prevent nested JSON issues
+			var parsedItems = new List<object>();
+
+			foreach (var jsonString in dataToSend[dataType])
+			{
+				try
+				{
+					// Parse the stored JSON string back to an object
+					var dataItem = JsonSerializer.Deserialize<Dictionary<string, object>>(jsonString);
+					if (dataItem != null)
+					{
+						parsedItems.Add(dataItem);
+					}
+				}
+				catch (Exception ex)
+				{
+					Console.WriteLine($"Error parsing data item: {ex.Message}");
+				}
+			}
+
+			// Add the parsed objects directly, not as JSON strings
+			aggregatedDataList.Add(new { DataType = dataType, Data = parsedItems });
 		}
 
 		if (aggregatedDataList.Count == 0)
@@ -936,6 +993,7 @@ class Aggregator
 		}
 	}
 
+
 	#endregion
 
 	#region Network Utilities
@@ -1002,7 +1060,7 @@ class Aggregator
 		}
 	}
 
-	/// <summary>
+	/// <summary>ProcessAndStoreDataItem
 	/// Waits for a confirmation message with the expected code.
 	/// </summary>
 	/// <param name="stream">The network stream to read the confirmation from</param>
