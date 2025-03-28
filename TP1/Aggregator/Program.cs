@@ -146,6 +146,32 @@ class Aggregator
 				Console.WriteLine($"Error saving configuration: {ex.Message}");
 			}
 		}
+
+		/// <summary>
+		/// Deletes the configuration file if it exists
+		/// </summary>
+		public static void DeleteConfigFile()
+		{
+			try
+			{
+				string configPath = "aggregator.config.json";
+				if (File.Exists(configPath))
+				{
+					File.Delete(configPath);
+					Console.WriteLine("Configuration file deleted successfully.");
+					Console.WriteLine("Default settings will be used on next restart.");
+				}
+				else
+				{
+					Console.WriteLine("Configuration file does not exist.");
+				}
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"Error deleting configuration file: {ex.Message}");
+			}
+		}
+
 	}
 
 
@@ -188,7 +214,9 @@ class Aggregator
 		Console.WriteLine("Press 'D' to show current data store");
 		Console.WriteLine("Press 'T' to show active threads");
 		Console.WriteLine("Press 'S' to save current configuration");
+		Console.WriteLine("Press 'X' to delete configuration file");
 		Console.WriteLine("Press 'Q' to quit");
+
 
 		// Start keyboard monitoring thread
 		Thread keyboardThread = new Thread(MonitorKeyboard) { IsBackground = true, Name = "KeyboardMonitor" };
@@ -272,7 +300,7 @@ class Aggregator
 
 	#endregion
 
-	#region Debug Interface
+	#region User Interface
 
 	/// <summary>
 	/// Monitors keyboard input for debugging commands.
@@ -303,6 +331,9 @@ class Aggregator
 							break;
 						case ConsoleKey.S:
 							Config.SaveToFile();
+							break;
+						case ConsoleKey.X:
+							Config.DeleteConfigFile();
 							break;
 						case ConsoleKey.Q:
 							Console.WriteLine("Shutting down aggregator...");

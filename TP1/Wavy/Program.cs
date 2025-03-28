@@ -167,6 +167,32 @@ public class Wavy
 				Console.WriteLine($"Error saving configuration: {ex.Message}");
 			}
 		}
+
+		/// <summary>
+		/// Deletes the configuration file if it exists
+		/// </summary>
+		public static void DeleteConfigFile()
+		{
+			try
+			{
+				string configPath = "wavy.config.json";
+				if (File.Exists(configPath))
+				{
+					File.Delete(configPath);
+					Console.WriteLine("Configuration file deleted successfully.");
+					Console.WriteLine("Default settings will be used on next restart.");
+				}
+				else
+				{
+					Console.WriteLine("Configuration file does not exist.");
+				}
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"Error deleting configuration file: {ex.Message}");
+			}
+		}
+
 	}
 
 	#endregion
@@ -405,6 +431,9 @@ public class Wavy
 							break;
 						case ConsoleKey.S:
 							Config.SaveToFile();
+							break;
+						case ConsoleKey.X:
+							Config.DeleteConfigFile();
 							break;
 						case ConsoleKey.Q:
 							Console.WriteLine("Shutting down Wavy client...");

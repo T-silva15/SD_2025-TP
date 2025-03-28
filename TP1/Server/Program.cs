@@ -7,35 +7,267 @@ using System.Text.Json;
 using System.Threading;
 using Microsoft.Data.SqlClient;
 
+/// <summary>
+/// Server class responsible for receiving and processing data from Aggregator clients.
+/// Handles network connections, data processing, and database storage for the OceanMonitor system.
+/// </summary>
 class Server
 {
+	#region Constants and Fields
+
+	/// <summary>
+	/// Lock object to prevent concurrent database access issues
+	/// </summary>
 	static readonly object dbLock = new object();
+
+	/// <summary>
+	/// Server listening port for incoming connections from Aggregators
+	/// </summary>
 	const int PORT = 6000;
+
+	/// <summary>
+	/// Dictionary to track connected aggregators by their ID
+	/// </summary>
 	static readonly Dictionary<string, DateTime> connectedAggregators = new Dictionary<string, DateTime>();
 
+	/// <summary>
+	/// Flag to control application execution
+	/// </summary>
+	static bool isRunning = true;
+
+	/// <summary>
+	/// Flag to enable detailed logging
+	/// </summary>
+	static bool detailedLogging = false;
+
+	/// <summary>
+	/// Database connection string
+	/// </summary>
+	static string connectionString = "Server=(localdb)\\mssqllocaldb;Database=OceanMonitor;Trusted_Connection=True;TrustServerCertificate=True;";
+
+	/// <summary>
+	/// Protocol message codes used in communication
+	/// </summary>
 	private static class MessageCodes
 	{
+		// Aggregator to Server codes
 		public const int AggregatorConnect = 102;
 		public const int AggregatorData = 301;
 		public const int AggregatorDataResend = 302;
 		public const int AggregatorDisconnect = 502;
+
+		// Server to Aggregator confirmation codes
 		public const int ServerConfirmation = 402;
 	}
 
+	#endregion
+
+	#region Entry Point and Main Thread Management
+
+	/// <summary>
+	/// Entry point for the server application.
+	/// Starts a TCP listener and continuously accepts connections from Aggregators.
+	/// </summary>
 	static void Main()
 	{
+		// Start keyboard monitoring thread for interactive commands
+		Thread keyboardThread = new Thread(MonitorKeyboard) { IsBackground = true, Name = "KeyboardMonitor" };
+		keyboardThread.Start();
+
+		// Initialize and start the TCP listener for incoming connections
 		TcpListener server = new TcpListener(IPAddress.Parse("127.0.0.1"), PORT);
 		server.Start();
 		Console.WriteLine($"[SERVER] Listening on port {PORT}...");
+		Console.WriteLine("\nAvailable Commands:");
+		Console.WriteLine("Press 'A' to show connected aggregators");
+		Console.WriteLine("Press 'D' to show database statistics");
+		Console.WriteLine("Press 'L' to toggle detailed logging");
+		Console.WriteLine("Press 'C' to modify connection string");
+		Console.WriteLine("Press 'Q' to quit");
 
-		while (true)
+		// Main server loop
+		while (isRunning)
 		{
-			TcpClient client = server.AcceptTcpClient();
-			Thread clientThread = new Thread(() => HandleAggregator(client));
-			clientThread.Start();
+			try
+			{
+				// Accept incoming client connections and handle each in a separate thread
+				TcpClient client = server.AcceptTcpClient();
+				Thread clientThread = new Thread(() => HandleAggregator(client))
+				{
+					IsBackground = true,
+					Name = $"Aggregator-{DateTime.Now.Ticks}"
+				};
+				clientThread.Start();
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"[ERROR] Failed to accept client connection: {ex.Message}");
+				// Short delay to prevent CPU usage spiking in case of repeated errors
+				Thread.Sleep(1000);
+			}
+		}
+
+		// Clean up resources when shutting down
+		server.Stop();
+		Console.WriteLine("[SERVER] Shutdown complete.");
+	}
+
+	/// <summary>
+	/// Monitors keyboard input for interactive commands
+	/// </summary>
+	static void MonitorKeyboard()
+	{
+		while (isRunning)
+		{
+			if (Console.KeyAvailable)
+			{
+				var key = Console.ReadKey(true).Key;
+				switch (key)
+				{
+					case ConsoleKey.A:
+						ShowConnectedAggregators();
+						break;
+					case ConsoleKey.D:
+						ShowDatabaseStatistics();
+						break;
+					case ConsoleKey.L:
+						detailedLogging = !detailedLogging;
+						Console.WriteLine($"Detailed logging: {(detailedLogging ? "ON" : "OFF")}");
+						break;
+					case ConsoleKey.C:
+						ModifyConnectionString();
+						break;
+					case ConsoleKey.Q:
+						Console.WriteLine("Shutting down server...");
+						isRunning = false;
+						break;
+				}
+			}
+			Thread.Sleep(100);
 		}
 	}
 
+	/// <summary>
+	/// Displays information about connected aggregators
+	/// </summary>
+	static void ShowConnectedAggregators()
+	{
+		Console.WriteLine("\n=== Connected Aggregators ===");
+		lock (connectedAggregators)
+		{
+			if (connectedAggregators.Count == 0)
+			{
+				Console.WriteLine("No aggregators connected.");
+			}
+			else
+			{
+				foreach (var kvp in connectedAggregators)
+				{
+					TimeSpan connectedFor = DateTime.Now - kvp.Value;
+					Console.WriteLine($"Aggregator ID: {kvp.Key}");
+					Console.WriteLine($"  Connected since: {kvp.Value:HH:mm:ss}");
+					Console.WriteLine($"  Connected for: {connectedFor.Hours}h {connectedFor.Minutes}m {connectedFor.Seconds}s");
+				}
+			}
+		}
+		Console.WriteLine("============================\n");
+	}
+
+	/// <summary>
+	/// Displays database statistics (counts of records in tables)
+	/// </summary>
+	static void ShowDatabaseStatistics()
+	{
+		Console.WriteLine("\n=== Database Statistics ===");
+		try
+		{
+			using (var connection = new SqlConnection(connectionString))
+			{
+				connection.Open();
+
+				// Get counts from main tables
+				var tableStats = new Dictionary<string, int>();
+
+				string[] tables = { "Aggregators", "Wavys", "WavyAggregatorMapping", "Measurements" };
+				foreach (var table in tables)
+				{
+					using (var cmd = new SqlCommand($"SELECT COUNT(*) FROM {table}", connection))
+					{
+						try
+						{
+							int count = (int)cmd.ExecuteScalar();
+							tableStats[table] = count;
+						}
+						catch
+						{
+							tableStats[table] = -1; // Table doesn't exist
+						}
+					}
+				}
+
+				// Display statistics
+				foreach (var stat in tableStats)
+				{
+					if (stat.Value >= 0)
+					{
+						Console.WriteLine($"Table {stat.Key}: {stat.Value} records");
+					}
+					else
+					{
+						Console.WriteLine($"Table {stat.Key}: Not found");
+					}
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			Console.WriteLine($"Error retrieving database statistics: {ex.Message}");
+		}
+		Console.WriteLine("==========================\n");
+	}
+
+	/// <summary>
+	/// Allows modifying the database connection string
+	/// </summary>
+	static void ModifyConnectionString()
+	{
+		Console.WriteLine($"\nCurrent connection string: {connectionString}");
+		Console.WriteLine("Enter new connection string (or leave empty to cancel):");
+		string input = Console.ReadLine();
+
+		if (!string.IsNullOrWhiteSpace(input))
+		{
+			// Test the connection string before saving
+			try
+			{
+				using (var connection = new SqlConnection(input))
+				{
+					connection.Open();
+					connectionString = input;
+					Console.WriteLine("Connection string updated successfully.");
+				}
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"Error with new connection string: {ex.Message}");
+				Console.WriteLine("Connection string not updated.");
+			}
+		}
+		else
+		{
+			Console.WriteLine("Operation cancelled. Connection string not changed.");
+		}
+	}
+
+	#endregion
+
+	#region Aggregator Connection Handling
+
+	/// <summary>
+	/// Handles communication with an individual Aggregator client.
+	/// Processes incoming data and sends confirmation responses.
+	/// </summary>
+	/// <param name="client">The TcpClient representing the connected Aggregator</param>
 	static void HandleAggregator(TcpClient client)
 	{
 		string aggregatorId = "Unknown";
@@ -104,6 +336,14 @@ class Server
 		}
 	}
 
+	/// <summary>
+	/// Processes a connection request from an Aggregator.
+	/// </summary>
+	/// <param name="buffer">The received data buffer</param>
+	/// <param name="bytesRead">Number of bytes read from the buffer</param>
+	/// <param name="stream">The network stream for sending responses</param>
+	/// <param name="clientIp">The client's IP address</param>
+	/// <returns>The Aggregator ID extracted from the connection request</returns>
 	static string ProcessConnection(byte[] buffer, int bytesRead, NetworkStream stream, string clientIp)
 	{
 		string aggregatorId = Encoding.UTF8.GetString(buffer, 4, bytesRead - 4);
@@ -119,6 +359,13 @@ class Server
 		return aggregatorId;
 	}
 
+	/// <summary>
+	/// Processes a disconnection request from an Aggregator.
+	/// </summary>
+	/// <param name="buffer">The received data buffer</param>
+	/// <param name="bytesRead">Number of bytes read from the buffer</param>
+	/// <param name="stream">The network stream for sending responses</param>
+	/// <param name="aggregatorId">Reference to the Aggregator ID</param>
 	static void ProcessDisconnection(byte[] buffer, int bytesRead, NetworkStream stream, ref string aggregatorId)
 	{
 		string receivedId = Encoding.UTF8.GetString(buffer, 4, bytesRead - 4);
@@ -136,10 +383,23 @@ class Server
 		SendConfirmation(stream, MessageCodes.ServerConfirmation);
 	}
 
+	/// <summary>
+	/// Processes data message from an Aggregator.
+	/// </summary>
+	/// <param name="buffer">The received data buffer</param>
+	/// <param name="bytesRead">Number of bytes read from the buffer</param>
+	/// <param name="stream">The network stream for sending responses</param>
+	/// <param name="code">The received message code</param>
+	/// <param name="aggregatorId">Reference to the Aggregator ID</param>
 	static void ProcessData(byte[] buffer, int bytesRead, NetworkStream stream, int code, ref string aggregatorId)
 	{
 		string jsonData = Encoding.UTF8.GetString(buffer, 4, bytesRead - 4);
 		Console.WriteLine($"[{code}] Data received from {(aggregatorId != "Unknown" ? "Aggregator " + aggregatorId : "unknown aggregator")}");
+
+		if (detailedLogging)
+		{
+			Console.WriteLine($"[DATA] {jsonData}");
+		}
 
 		try
 		{
@@ -157,9 +417,18 @@ class Server
 		catch (Exception ex)
 		{
 			Console.WriteLine($"[ERROR] Failed to process data: {ex.Message}");
+			if (detailedLogging && ex.InnerException != null)
+			{
+				Console.WriteLine($"[ERROR] Inner exception: {ex.InnerException.Message}");
+			}
 		}
 	}
 
+	/// <summary>
+	/// Sends a confirmation message with the specified code.
+	/// </summary>
+	/// <param name="stream">The network stream to send the confirmation to</param>
+	/// <param name="code">The confirmation code to send</param>
 	static void SendConfirmation(NetworkStream stream, int code)
 	{
 		try
@@ -173,11 +442,19 @@ class Server
 		}
 	}
 
+	#endregion
+
+	#region Database Operations
+
+	/// <summary>
+	/// Stores the received aggregator data in the database.
+	/// Uses a lock to prevent concurrent database access.
+	/// </summary>
+	/// <param name="data">Dictionary containing aggregator data</param>
 	static void SaveToDatabase(Dictionary<string, object> data)
 	{
 		lock (dbLock)
 		{
-			string connectionString = "Server=(localdb)\\mssqllocaldb;Database=OceanMonitor;Trusted_Connection=True;TrustServerCertificate=True;";
 			using (var connection = new SqlConnection(connectionString))
 			{
 				try
@@ -270,7 +547,15 @@ class Server
 		}
 	}
 
-	// Helper method to process a measurement and insert it into the new database structure
+	/// <summary>
+	/// Helper method to process a measurement and insert it into the database.
+	/// </summary>
+	/// <param name="connection">The SQL connection</param>
+	/// <param name="transaction">The SQL transaction</param>
+	/// <param name="element">The JSON element containing measurement data</param>
+	/// <param name="dataType">The type of data (e.g., "Temperature")</param>
+	/// <param name="aggregatorId">The Aggregator ID</param>
+	/// <param name="timestamp">The timestamp for the measurement</param>
 	static void ProcessMeasurement(SqlConnection connection, SqlTransaction transaction,
 								  JsonElement element, string dataType, string aggregatorId, DateTime timestamp)
 	{
@@ -369,7 +654,10 @@ class Server
 				cmd.ExecuteNonQuery();
 			}
 
-			Console.WriteLine($"[DB] Measurement saved: WavyID={wavyId}, Type={dataType}, Value={value}");
+			if (detailedLogging)
+			{
+				Console.WriteLine($"[DB] Measurement saved: WavyID={wavyId}, Type={dataType}, Value={value}");
+			}
 		}
 		catch (Exception ex)
 		{
@@ -377,8 +665,12 @@ class Server
 		}
 	}
 
-
-	// Helper method to safely extract double values from different JSON types
+	/// <summary>
+	/// Helper method to safely extract double values from different JSON types
+	/// </summary>
+	/// <param name="element">The JSON element containing the value</param>
+	/// <param name="value">The extracted double value (output)</param>
+	/// <returns>True if value was successfully extracted, false otherwise</returns>
 	static bool TryGetDoubleValue(JsonElement element, out double value)
 	{
 		value = 0;
@@ -396,4 +688,6 @@ class Server
 				return false;
 		}
 	}
+
+	#endregion
 }
