@@ -177,86 +177,223 @@ class Server
 	{
 		lock (dbLock)
 		{
-			string connectionString = "Server=localhost;Database=OceanMonitor;Trusted_Connection=True;";
+			string connectionString = "Server=(localdb)\\mssqllocaldb;Database=OceanMonitor;Trusted_Connection=True;TrustServerCertificate=True;";
 			using (var connection = new SqlConnection(connectionString))
 			{
-				connection.Open();
-
-				string aggregatorId = data["AggregatorId"].ToString();
-				DateTime timestamp = DateTime.Parse(data["Timestamp"].ToString());
-				var dataList = JsonSerializer.Deserialize<List<Dictionary<string, object>>>(data["Data"].ToString());
-
-				foreach (var item in dataList)
+				try
 				{
-					string dataType = item["DataType"].ToString();
-					double totalValue = Convert.ToDouble(item["TotalValue"]);
-					var wavyIds = JsonSerializer.Deserialize<List<string>>(item["WavyIds"].ToString());
-
-					foreach (var wavyId in wavyIds)
+					connection.Open();
+					using (var transaction = connection.BeginTransaction())
 					{
-						UpdateOrInsertWavy(connection, wavyId, dataType, totalValue);
-
-						string sqlAgr = @"
-                            IF NOT EXISTS (SELECT 1 FROM Agregadores WHERE AgrID = @ag)
-                            INSERT INTO Agregadores (AgrID, WavyID, Timestamp)
-                            VALUES (@ag, @wavy, @ts)";
-
-						using (var cmd = new SqlCommand(sqlAgr, connection))
+						try
 						{
-							cmd.Parameters.AddWithValue("@ag", aggregatorId);
-							cmd.Parameters.AddWithValue("@wavy", wavyId);
-							cmd.Parameters.AddWithValue("@ts", timestamp);
-							cmd.ExecuteNonQuery();
+							string aggregatorId = data["AggregatorId"].ToString();
+							DateTime timestamp = DateTime.Parse(data["Timestamp"].ToString());
+
+							// Update or insert Aggregator record
+							string updateAggregator = @"
+                            IF EXISTS (SELECT 1 FROM Aggregators WHERE AggregatorID = @id)
+                                UPDATE Aggregators SET LastSeen = @ts, Status = 'Active' WHERE AggregatorID = @id
+                            ELSE
+                                INSERT INTO Aggregators (AggregatorID, LastSeen, Status) VALUES (@id, @ts, 'Active')";
+
+							using (var cmd = new SqlCommand(updateAggregator, connection, transaction))
+							{
+								cmd.Parameters.AddWithValue("@id", aggregatorId);
+								cmd.Parameters.AddWithValue("@ts", timestamp);
+								cmd.ExecuteNonQuery();
+							}
+
+							// Get Data as JsonElement
+							var dataElement = (JsonElement)data["Data"];
+
+							// Process each data item in the list
+							foreach (JsonElement item in dataElement.EnumerateArray())
+							{
+								string dataType = item.GetProperty("DataType").GetString();
+								JsonElement dataArray;
+
+								// Handle Data property which could be either a string or an array
+								if (item.TryGetProperty("Data", out dataArray))
+								{
+									// Handle the case where Data is an array
+									if (dataArray.ValueKind == JsonValueKind.Array)
+									{
+										foreach (JsonElement dataItem in dataArray.EnumerateArray())
+										{
+											// Process each data item which could be a string or an object
+											ProcessMeasurement(connection, transaction, dataItem, dataType, aggregatorId, timestamp);
+										}
+									}
+									// Handle case where Data might be a single string that needs parsing
+									else if (dataArray.ValueKind == JsonValueKind.String)
+									{
+										string dataJson = dataArray.GetString();
+										try
+										{
+											using (JsonDocument doc = JsonDocument.Parse(dataJson))
+											{
+												ProcessMeasurement(connection, transaction, doc.RootElement, dataType, aggregatorId, timestamp);
+											}
+										}
+										catch (JsonException)
+										{
+											Console.WriteLine($"[WARNING] Could not parse Data string as JSON: {dataJson}");
+										}
+									}
+								}
+								else
+								{
+									Console.WriteLine($"[WARNING] Data property not found for data type {dataType}");
+								}
+							}
+
+							transaction.Commit();
+							Console.WriteLine("[DB] Data successfully inserted into database tables.");
+						}
+						catch (Exception ex)
+						{
+							transaction.Rollback();
+							throw new Exception($"Transaction rolled back: {ex.Message}", ex);
 						}
 					}
 				}
-
-				Console.WriteLine("[DB] Data inserted into WAVYS and AGREGADORES tables.");
+				catch (Exception ex)
+				{
+					Console.WriteLine($"[ERROR] Database operation failed: {ex.Message}");
+					if (ex.InnerException != null)
+					{
+						Console.WriteLine($"[ERROR] Inner exception: {ex.InnerException.Message}");
+					}
+				}
 			}
 		}
 	}
 
-	static void UpdateOrInsertWavy(SqlConnection connection, string wavyId, string dataType, double value)
+	// Helper method to process a measurement and insert it into the new database structure
+	static void ProcessMeasurement(SqlConnection connection, SqlTransaction transaction,
+								  JsonElement element, string dataType, string aggregatorId, DateTime timestamp)
 	{
-		string checkSql = "SELECT COUNT(*) FROM Wavys WHERE WavyID = @id";
-		using (var checkCmd = new SqlCommand(checkSql, connection))
+		try
 		{
-			checkCmd.Parameters.AddWithValue("@id", wavyId);
-			int count = (int)checkCmd.ExecuteScalar();
-
-			string column = dataType switch
+			// If element is a string, try to parse it as JSON
+			if (element.ValueKind == JsonValueKind.String)
 			{
-				"Temperature" => "Temperatura",
-				"Velocity" => "Velocidade",
-				"Decibels" => "Decibeis",
-				"Frequency" => "Frequencia",
-				_ => null
-			};
-
-			if (column == null) return;
-
-			if (count > 0)
-			{
-				string updateSql = $"UPDATE Wavys SET {column} = @val WHERE WavyID = @id";
-				using (var updateCmd = new SqlCommand(updateSql, connection))
+				string json = element.GetString();
+				using (JsonDocument doc = JsonDocument.Parse(json))
 				{
-					updateCmd.Parameters.AddWithValue("@val", value);
-					updateCmd.Parameters.AddWithValue("@id", wavyId);
-					updateCmd.ExecuteNonQuery();
+					ProcessMeasurement(connection, transaction, doc.RootElement, dataType, aggregatorId, timestamp);
 				}
+				return;
 			}
-			else
+
+			// Extract WavyId and Value
+			string wavyId = "Unknown";
+			double value = 0;
+			bool valueFound = false;
+
+			// Extract WavyId - check different possible property names
+			if (element.TryGetProperty("WavyId", out JsonElement wavyIdElement))
 			{
-				string insertSql = $@"
-                    INSERT INTO Wavys (WavyID, {column}) 
-                    VALUES (@id, @val)";
-				using (var insertCmd = new SqlCommand(insertSql, connection))
-				{
-					insertCmd.Parameters.AddWithValue("@id", wavyId);
-					insertCmd.Parameters.AddWithValue("@val", value);
-					insertCmd.ExecuteNonQuery();
-				}
+				wavyId = wavyIdElement.GetString();
 			}
+			else if (element.TryGetProperty("wavyId", out wavyIdElement))
+			{
+				wavyId = wavyIdElement.GetString();
+			}
+
+			// Extract Value - check different possible property names and types
+			if (element.TryGetProperty("Value", out JsonElement valueElement))
+			{
+				valueFound = TryGetDoubleValue(valueElement, out value);
+			}
+			else if (element.TryGetProperty("value", out valueElement))
+			{
+				valueFound = TryGetDoubleValue(valueElement, out value);
+			}
+
+			if (!valueFound)
+			{
+				Console.WriteLine($"[WARNING] No valid value found in measurement data");
+				return;
+			}
+
+			// Skip unknown Wavy IDs
+			if (wavyId == "Unknown")
+			{
+				Console.WriteLine($"[WARNING] No Wavy ID found for measurement, using 'Unknown'");
+			}
+
+			// Ensure the Wavy device exists
+			string ensureWavy = @"
+            IF NOT EXISTS (SELECT 1 FROM Wavys WHERE WavyID = @id)
+                INSERT INTO Wavys (WavyID, LastSeen) VALUES (@id, @ts)
+            ELSE
+                UPDATE Wavys SET LastSeen = @ts WHERE WavyID = @id";
+
+			using (var cmd = new SqlCommand(ensureWavy, connection, transaction))
+			{
+				cmd.Parameters.AddWithValue("@id", wavyId);
+				cmd.Parameters.AddWithValue("@ts", timestamp);
+				cmd.ExecuteNonQuery();
+			}
+
+			// Update or insert mapping between Wavy and Aggregator
+			string updateMapping = @"
+            IF EXISTS (SELECT 1 FROM WavyAggregatorMapping WHERE WavyID = @wid AND AggregatorID = @aid)
+                UPDATE WavyAggregatorMapping SET LastConnected = @ts WHERE WavyID = @wid AND AggregatorID = @aid
+            ELSE
+                INSERT INTO WavyAggregatorMapping (WavyID, AggregatorID, FirstConnected, LastConnected) 
+                VALUES (@wid, @aid, @ts, @ts)";
+
+			using (var cmd = new SqlCommand(updateMapping, connection, transaction))
+			{
+				cmd.Parameters.AddWithValue("@wid", wavyId);
+				cmd.Parameters.AddWithValue("@aid", aggregatorId);
+				cmd.Parameters.AddWithValue("@ts", timestamp);
+				cmd.ExecuteNonQuery();
+			}
+
+			// Insert measurement
+			string insertMeasurement = @"
+            INSERT INTO Measurements (WavyID, AggregatorID, DataType, Value, Timestamp)
+            VALUES (@wid, @aid, @type, @val, @ts)";
+
+			using (var cmd = new SqlCommand(insertMeasurement, connection, transaction))
+			{
+				cmd.Parameters.AddWithValue("@wid", wavyId);
+				cmd.Parameters.AddWithValue("@aid", aggregatorId);
+				cmd.Parameters.AddWithValue("@type", dataType);
+				cmd.Parameters.AddWithValue("@val", value);
+				cmd.Parameters.AddWithValue("@ts", timestamp);
+				cmd.ExecuteNonQuery();
+			}
+
+			Console.WriteLine($"[DB] Measurement saved: WavyID={wavyId}, Type={dataType}, Value={value}");
+		}
+		catch (Exception ex)
+		{
+			Console.WriteLine($"[WARNING] Error processing measurement: {ex.Message}");
+		}
+	}
+
+
+	// Helper method to safely extract double values from different JSON types
+	static bool TryGetDoubleValue(JsonElement element, out double value)
+	{
+		value = 0;
+
+		switch (element.ValueKind)
+		{
+			case JsonValueKind.Number:
+				value = element.GetDouble();
+				return true;
+
+			case JsonValueKind.String:
+				return double.TryParse(element.GetString(), out value);
+
+			default:
+				return false;
 		}
 	}
 }

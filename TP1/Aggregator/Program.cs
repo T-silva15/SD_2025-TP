@@ -696,14 +696,41 @@ class Aggregator
 				dataStore[dataType] = new ConcurrentBag<string>();
 			}
 
-			// Add the data item to the store
-			dataStore[dataType].Add(item.GetRawText());
+			// Before storing, add the WavyId if it's available but not in the item
+			if (wavyId != null)
+			{
+				// We need to make a new object with the WavyId added
+				var dataWithWavyId = new Dictionary<string, object>();
+
+				// Copy all existing properties
+				foreach (JsonProperty prop in item.EnumerateObject())
+				{
+					if (prop.Name == "DataType")
+						dataWithWavyId["DataType"] = prop.Value.GetString();
+					else if (prop.Name == "Value")
+						dataWithWavyId["Value"] = prop.Value.GetDouble();
+					else
+						dataWithWavyId[prop.Name] = JsonSerializer.Deserialize<object>(prop.Value.GetRawText());
+				}
+
+				// Add the WavyId
+				dataWithWavyId["WavyId"] = wavyId;
+
+				// Serialize to JSON and store
+				string jsonData = JsonSerializer.Serialize(dataWithWavyId);
+				dataStore[dataType].Add(jsonData);
+			}
+			else
+			{
+				// No WavyId available, store as is
+				dataStore[dataType].Add(item.GetRawText());
+			}
 
 			// Output details in verbose mode
 			if (verboseMode && item.TryGetProperty("Value", out JsonElement valueElement))
 			{
-				long value = valueElement.GetInt64();
-				Console.WriteLine($"  - {dataType}: {value}");
+				double value = valueElement.GetDouble();
+				Console.WriteLine($"  - {dataType}: {value}{(wavyId != null ? $" (Wavy: {wavyId})" : "")}");
 			}
 		}
 		catch (Exception ex)
@@ -711,6 +738,7 @@ class Aggregator
 			Console.WriteLine($"Error processing data item: {ex.Message}");
 		}
 	}
+
 
 	#endregion
 
