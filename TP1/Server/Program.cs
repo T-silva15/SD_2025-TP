@@ -8,8 +8,8 @@ using System.Threading;
 using Microsoft.Data.SqlClient;
 
 /// <summary>
-/// Server class responsible for receiving and processing data from Aggregator clients.
-/// Handles network connections, data processing, and database storage for the OceanMonitor system.
+/// Server component of the OceanMonitor system responsible for receiving, processing,
+/// and storing data from Aggregator clients in a SQL database.
 /// </summary>
 class Server
 {
@@ -26,78 +26,63 @@ class Server
 	const int PORT = 6000;
 
 	/// <summary>
-	/// Dictionary to track connected aggregators by their ID
+	/// Tracks connected aggregators by their ID and connection timestamp
 	/// </summary>
 	static readonly Dictionary<string, DateTime> connectedAggregators = new Dictionary<string, DateTime>();
 
 	/// <summary>
-	/// Flag to control application execution
+	/// Controls application execution state
 	/// </summary>
 	static bool isRunning = true;
 
 	/// <summary>
-	/// Flag to enable detailed logging
+	/// Controls detailed logging output for debugging
 	/// </summary>
 	static bool verboseMode = false;
 
 	/// <summary>
-	/// Database connection string
+	/// Database connection string for SQL Server
 	/// </summary>
 	static string connectionString = "Server=(localdb)\\mssqllocaldb;Database=OceanMonitor;Trusted_Connection=True;TrustServerCertificate=True;";
 
 	/// <summary>
-	/// Protocol message codes used in communication
+	/// Protocol message codes used in the Aggregator-Server communication protocol
 	/// </summary>
 	private static class MessageCodes
 	{
-		// Aggregator to Server codes
 		public const int AggregatorConnect = 102;
 		public const int AggregatorData = 301;
 		public const int AggregatorDataResend = 302;
 		public const int AggregatorDisconnect = 502;
-
-		// Server to Aggregator confirmation codes
 		public const int ServerConfirmation = 402;
 	}
 
 	/// <summary>
-	/// Inactivity threshold in hours before marking a device as inactive
+	/// Determines when devices are considered inactive
 	/// </summary>
-	static readonly int InactivityThresholdHours = 1; // Temporary value for testing - 1 hour
+	static readonly int InactivityThresholdHours = 1;
 
 	#endregion
 
 	#region Entry Point and Main Thread Management
 
 	/// <summary>
-	/// Entry point for the server application.
-	/// Starts a TCP listener and continuously accepts connections from Aggregators.
+	/// Application entry point. Initializes server components and starts handling connections.
 	/// </summary>
 	static void Main()
 	{
-		// Start keyboard monitoring thread for interactive commands
 		Thread keyboardThread = new Thread(MonitorKeyboard) { IsBackground = true, Name = "KeyboardMonitor" };
 		keyboardThread.Start();
 
-		// Initialize and start the TCP listener for incoming connections
 		TcpListener server = new TcpListener(IPAddress.Parse("127.0.0.1"), PORT);
 		server.Start();
 		Console.WriteLine($"[SERVER] Listening on port {PORT}...");
-		Console.WriteLine("\nAvailable Commands:");
-		Console.WriteLine("Press 'A' to show connected aggregators");
-		Console.WriteLine("Press 'D' to show database statistics");
-		Console.WriteLine("Press 'V' to toggle verbose mode");
-		Console.WriteLine("Press 'C' to modify connection string");
-		Console.WriteLine("Press 'I' to check for inactive devices");
-		Console.WriteLine("Press 'W' to clear screen");
-		Console.WriteLine("Press 'Q' to quit");
+		DisplayCommandMenu();
 
-		// Main server loop
 		while (isRunning)
 		{
 			try
 			{
-				// Accept incoming client connections and handle each in a separate thread
 				TcpClient client = server.AcceptTcpClient();
 				Thread clientThread = new Thread(() => HandleAggregator(client))
 				{
@@ -109,14 +94,27 @@ class Server
 			catch (Exception ex)
 			{
 				Console.WriteLine($"[ERROR] Failed to accept client connection: {ex.Message}");
-				// Short delay to prevent CPU usage spiking in case of repeated errors
 				Thread.Sleep(1000);
 			}
 		}
 
-		// Clean up resources when shutting down
 		server.Stop();
 		Console.WriteLine("[SERVER] Shutdown complete.");
+	}
+
+	/// <summary>
+	/// Displays the available commands in the console
+	/// </summary>
+	static void DisplayCommandMenu()
+	{
+		Console.WriteLine("\nAvailable Commands:");
+		Console.WriteLine("Press 'A' to show connected aggregators");
+		Console.WriteLine("Press 'D' to show database statistics");
+		Console.WriteLine("Press 'V' to toggle verbose mode");
+		Console.WriteLine("Press 'C' to modify connection string");
+		Console.WriteLine("Press 'I' to check for inactive devices");
+		Console.WriteLine("Press 'W' to clear screen");
+		Console.WriteLine("Press 'Q' to quit");
 	}
 
 	/// <summary>
@@ -197,11 +195,9 @@ class Server
 			using (var connection = new SqlConnection(connectionString))
 			{
 				connection.Open();
-
-				// Get counts from main tables
 				var tableStats = new Dictionary<string, int>();
-
 				string[] tables = { "Aggregators", "Wavys", "WavyAggregatorMapping", "Measurements" };
+
 				foreach (var table in tables)
 				{
 					using (var cmd = new SqlCommand($"SELECT COUNT(*) FROM {table}", connection))
@@ -218,7 +214,6 @@ class Server
 					}
 				}
 
-				// Display statistics
 				foreach (var stat in tableStats)
 				{
 					if (stat.Value >= 0)
@@ -250,7 +245,6 @@ class Server
 
 		if (!string.IsNullOrWhiteSpace(input))
 		{
-			// Test the connection string before saving
 			try
 			{
 				using (var connection = new SqlConnection(input))
@@ -273,8 +267,7 @@ class Server
 	}
 
 	/// <summary>
-	/// Checks for and removes inactive Aggregators and Wavys from the database
-	/// based on the defined InactivityThresholdHours threshold
+	/// Identifies and optionally removes inactive devices from the database
 	/// </summary>
 	static void CheckInactiveDevices()
 	{
@@ -295,86 +288,17 @@ class Server
 					{
 						try
 						{
-							// Count inactive devices before deletion
-							int inactiveAggregatorsCount = 0;
-							int inactiveWavysCount = 0;
-
-							// Count inactive Aggregators
-							using (var cmd = new SqlCommand(
-								"SELECT COUNT(*) FROM Aggregators WHERE LastSeen < @threshold",
-								connection, transaction))
-							{
-								cmd.Parameters.AddWithValue("@threshold", inactiveThreshold);
-								inactiveAggregatorsCount = (int)cmd.ExecuteScalar();
-							}
-
-							// Count inactive Wavys
-							using (var cmd = new SqlCommand(
-								"SELECT COUNT(*) FROM Wavys WHERE LastSeen < @threshold",
-								connection, transaction))
-							{
-								cmd.Parameters.AddWithValue("@threshold", inactiveThreshold);
-								inactiveWavysCount = (int)cmd.ExecuteScalar();
-							}
+							// Count inactive devices
+							int inactiveAggregatorsCount = CountInactiveAggregators(connection, transaction, inactiveThreshold);
+							int inactiveWavysCount = CountInactiveWavys(connection, transaction, inactiveThreshold);
 
 							Console.WriteLine($"Found {inactiveAggregatorsCount} inactive Aggregators and {inactiveWavysCount} inactive Wavys");
 
 							if (inactiveAggregatorsCount > 0 || inactiveWavysCount > 0)
 							{
-								Console.Write("Do you want to remove these inactive devices? (y/n): ");
-								string answer = Console.ReadLine()?.ToLower();
-
-								if (answer == "y" || answer == "yes")
+								if (ConfirmDeletion())
 								{
-									// First, delete measurements from inactive Wavys
-									string deleteMeasurementsFromWavys = @"
-                                    DELETE FROM Measurements 
-                                    WHERE WavyID IN (SELECT WavyID FROM Wavys WHERE LastSeen < @threshold)";
-									using (var cmd = new SqlCommand(deleteMeasurementsFromWavys, connection, transaction))
-									{
-										cmd.Parameters.AddWithValue("@threshold", inactiveThreshold);
-										cmd.ExecuteNonQuery();
-									}
-
-									// Delete measurements from inactive Aggregators
-									string deleteMeasurementsFromAggregators = @"
-                                    DELETE FROM Measurements 
-                                    WHERE AggregatorID IN (SELECT AggregatorID FROM Aggregators WHERE LastSeen < @threshold)";
-									using (var cmd = new SqlCommand(deleteMeasurementsFromAggregators, connection, transaction))
-									{
-										cmd.Parameters.AddWithValue("@threshold", inactiveThreshold);
-										cmd.ExecuteNonQuery();
-									}
-
-									// Delete mappings involving inactive devices
-									string deleteMappings = @"
-                                    DELETE FROM WavyAggregatorMapping
-                                    WHERE WavyID IN (SELECT WavyID FROM Wavys WHERE LastSeen < @threshold)
-                                    OR AggregatorID IN (SELECT AggregatorID FROM Aggregators WHERE LastSeen < @threshold)";
-									using (var cmd = new SqlCommand(deleteMappings, connection, transaction))
-									{
-										cmd.Parameters.AddWithValue("@threshold", inactiveThreshold);
-										cmd.ExecuteNonQuery();
-									}
-
-									// Delete inactive Wavys
-									string deleteWavys = "DELETE FROM Wavys WHERE LastSeen < @threshold";
-									using (var cmd = new SqlCommand(deleteWavys, connection, transaction))
-									{
-										cmd.Parameters.AddWithValue("@threshold", inactiveThreshold);
-										int removedWavys = cmd.ExecuteNonQuery();
-										Console.WriteLine($"Removed {removedWavys} inactive Wavy devices");
-									}
-
-									// Delete inactive Aggregators
-									string deleteAggregators = "DELETE FROM Aggregators WHERE LastSeen < @threshold";
-									using (var cmd = new SqlCommand(deleteAggregators, connection, transaction))
-									{
-										cmd.Parameters.AddWithValue("@threshold", inactiveThreshold);
-										int removedAggregators = cmd.ExecuteNonQuery();
-										Console.WriteLine($"Removed {removedAggregators} inactive Aggregator devices");
-									}
-
+									DeleteInactiveDeviceData(connection, transaction, inactiveThreshold);
 									transaction.Commit();
 									Console.WriteLine("Inactive devices successfully removed from the database.");
 								}
@@ -412,20 +336,106 @@ class Server
 	}
 
 	/// <summary>
+	/// Counts the number of inactive aggregators in the database
+	/// </summary>
+	static int CountInactiveAggregators(SqlConnection connection, SqlTransaction transaction, DateTime threshold)
+	{
+		using (var cmd = new SqlCommand(
+			"SELECT COUNT(*) FROM Aggregators WHERE LastSeen < @threshold",
+			connection, transaction))
+		{
+			cmd.Parameters.AddWithValue("@threshold", threshold);
+			return (int)cmd.ExecuteScalar();
+		}
+	}
+
+	/// <summary>
+	/// Counts the number of inactive Wavy devices in the database
+	/// </summary>
+	static int CountInactiveWavys(SqlConnection connection, SqlTransaction transaction, DateTime threshold)
+	{
+		using (var cmd = new SqlCommand(
+			"SELECT COUNT(*) FROM Wavys WHERE LastSeen < @threshold",
+			connection, transaction))
+		{
+			cmd.Parameters.AddWithValue("@threshold", threshold);
+			return (int)cmd.ExecuteScalar();
+		}
+	}
+
+	/// <summary>
+	/// Asks for user confirmation before deleting inactive devices
+	/// </summary>
+	static bool ConfirmDeletion()
+	{
+		Console.Write("Do you want to remove these inactive devices? (y/n): ");
+		string answer = Console.ReadLine()?.ToLower();
+		return answer == "y" || answer == "yes";
+	}
+
+	/// <summary>
+	/// Deletes all data related to inactive devices from the database
+	/// </summary>
+	static void DeleteInactiveDeviceData(SqlConnection connection, SqlTransaction transaction, DateTime threshold)
+	{
+		// Delete measurements from inactive Wavys
+		string deleteMeasurementsFromWavys = @"
+            DELETE FROM Measurements 
+            WHERE WavyID IN (SELECT WavyID FROM Wavys WHERE LastSeen < @threshold)";
+		using (var cmd = new SqlCommand(deleteMeasurementsFromWavys, connection, transaction))
+		{
+			cmd.Parameters.AddWithValue("@threshold", threshold);
+			cmd.ExecuteNonQuery();
+		}
+
+		// Delete measurements from inactive Aggregators
+		string deleteMeasurementsFromAggregators = @"
+            DELETE FROM Measurements 
+            WHERE AggregatorID IN (SELECT AggregatorID FROM Aggregators WHERE LastSeen < @threshold)";
+		using (var cmd = new SqlCommand(deleteMeasurementsFromAggregators, connection, transaction))
+		{
+			cmd.Parameters.AddWithValue("@threshold", threshold);
+			cmd.ExecuteNonQuery();
+		}
+
+		// Delete mappings involving inactive devices
+		string deleteMappings = @"
+            DELETE FROM WavyAggregatorMapping
+            WHERE WavyID IN (SELECT WavyID FROM Wavys WHERE LastSeen < @threshold)
+            OR AggregatorID IN (SELECT AggregatorID FROM Aggregators WHERE LastSeen < @threshold)";
+		using (var cmd = new SqlCommand(deleteMappings, connection, transaction))
+		{
+			cmd.Parameters.AddWithValue("@threshold", threshold);
+			cmd.ExecuteNonQuery();
+		}
+
+		// Delete inactive Wavys
+		string deleteWavys = "DELETE FROM Wavys WHERE LastSeen < @threshold";
+		using (var cmd = new SqlCommand(deleteWavys, connection, transaction))
+		{
+			cmd.Parameters.AddWithValue("@threshold", threshold);
+			int removedWavys = cmd.ExecuteNonQuery();
+			Console.WriteLine($"Removed {removedWavys} inactive Wavy devices");
+		}
+
+		// Delete inactive Aggregators
+		string deleteAggregators = "DELETE FROM Aggregators WHERE LastSeen < @threshold";
+		using (var cmd = new SqlCommand(deleteAggregators, connection, transaction))
+		{
+			cmd.Parameters.AddWithValue("@threshold", threshold);
+			int removedAggregators = cmd.ExecuteNonQuery();
+			Console.WriteLine($"Removed {removedAggregators} inactive Aggregator devices");
+		}
+	}
+
+	/// <summary>
 	/// Clears the console screen and displays the menu again
 	/// </summary>
 	static void ClearScreenAndShowMenu()
 	{
 		Console.Clear();
 		Console.WriteLine($"[SERVER] Listening on port {PORT}...");
-		Console.WriteLine("\nAvailable Commands:");
-		Console.WriteLine("Press 'A' to show connected aggregators");
-		Console.WriteLine("Press 'D' to show database statistics");
-		Console.WriteLine("Press 'V' to toggle verbose mode");
-		Console.WriteLine("Press 'C' to modify connection string");
-		Console.WriteLine("Press 'I' to check for inactive devices");
-		Console.WriteLine("Press 'W' to clear screen");
-		Console.WriteLine("Press 'Q' to quit");
+		DisplayCommandMenu();
 	}
 
 	#endregion
@@ -433,10 +443,10 @@ class Server
 	#region Aggregator Connection Handling
 
 	/// <summary>
-	/// Handles communication with an individual Aggregator client.
-	/// Processes incoming data and sends confirmation responses.
+	/// Handles communication with an Aggregator client, processing incoming messages
+	/// and maintaining the connection until closed.
 	/// </summary>
-	/// <param name="client">The TcpClient representing the connected Aggregator</param>
+	/// <param name="client">TCP client connection from an Aggregator</param>
 	static void HandleAggregator(TcpClient client)
 	{
 		string aggregatorId = "Unknown";
@@ -506,13 +516,9 @@ class Server
 	}
 
 	/// <summary>
-	/// Processes a connection request from an Aggregator.
+	/// Processes an Aggregator connection request and registers the connection
 	/// </summary>
-	/// <param name="buffer">The received data buffer</param>
-	/// <param name="bytesRead">Number of bytes read from the buffer</param>
-	/// <param name="stream">The network stream for sending responses</param>
-	/// <param name="clientIp">The client's IP address</param>
-	/// <returns>The Aggregator ID extracted from the connection request</returns>
+	/// <returns>The Aggregator ID from the connection request</returns>
 	static string ProcessConnection(byte[] buffer, int bytesRead, NetworkStream stream, string clientIp)
 	{
 		string aggregatorId = Encoding.UTF8.GetString(buffer, 4, bytesRead - 4);
@@ -529,12 +535,8 @@ class Server
 	}
 
 	/// <summary>
-	/// Processes a disconnection request from an Aggregator.
+	/// Processes an Aggregator disconnection request and removes the connection registration
 	/// </summary>
-	/// <param name="buffer">The received data buffer</param>
-	/// <param name="bytesRead">Number of bytes read from the buffer</param>
-	/// <param name="stream">The network stream for sending responses</param>
-	/// <param name="aggregatorId">Reference to the Aggregator ID</param>
 	static void ProcessDisconnection(byte[] buffer, int bytesRead, NetworkStream stream, ref string aggregatorId)
 	{
 		string receivedId = Encoding.UTF8.GetString(buffer, 4, bytesRead - 4);
@@ -553,13 +555,8 @@ class Server
 	}
 
 	/// <summary>
-	/// Processes data message from an Aggregator.
+	/// Processes data received from an Aggregator, deserializes it, and stores it in the database
 	/// </summary>
-	/// <param name="buffer">The received data buffer</param>
-	/// <param name="bytesRead">Number of bytes read from the buffer</param>
-	/// <param name="stream">The network stream for sending responses</param>
-	/// <param name="code">The received message code</param>
-	/// <param name="aggregatorId">Reference to the Aggregator ID</param>
 	static void ProcessData(byte[] buffer, int bytesRead, NetworkStream stream, int code, ref string aggregatorId)
 	{
 		string jsonData = Encoding.UTF8.GetString(buffer, 4, bytesRead - 4);
@@ -594,10 +591,8 @@ class Server
 	}
 
 	/// <summary>
-	/// Sends a confirmation message with the specified code.
+	/// Sends a confirmation code to an Aggregator
 	/// </summary>
-	/// <param name="stream">The network stream to send the confirmation to</param>
-	/// <param name="code">The confirmation code to send</param>
 	static void SendConfirmation(NetworkStream stream, int code)
 	{
 		try
@@ -616,10 +611,9 @@ class Server
 	#region Database Operations
 
 	/// <summary>
-	/// Stores the received aggregator data in the database.
-	/// Uses a lock to prevent concurrent database access.
+	/// Stores received data from an Aggregator in the database
 	/// </summary>
-	/// <param name="data">Dictionary containing aggregator data</param>
+	/// <param name="data">Dictionary containing deserialized aggregator data</param>
 	static void SaveToDatabase(Dictionary<string, object> data)
 	{
 		lock (dbLock)
@@ -637,62 +631,11 @@ class Server
 							DateTime timestamp = DateTime.Parse(data["Timestamp"].ToString());
 
 							// Update or insert Aggregator record
-							string updateAggregator = @"
-							IF EXISTS (SELECT 1 FROM Aggregators WHERE AggregatorID = @id)
-								UPDATE Aggregators SET LastSeen = @ts WHERE AggregatorID = @id
-							ELSE
-								INSERT INTO Aggregators (AggregatorID, LastSeen) VALUES (@id, @ts)";
+							UpsertAggregator(connection, transaction, aggregatorId, timestamp);
 
-							using (var cmd = new SqlCommand(updateAggregator, connection, transaction))
-							{
-								cmd.Parameters.AddWithValue("@id", aggregatorId);
-								cmd.Parameters.AddWithValue("@ts", timestamp);
-								cmd.ExecuteNonQuery();
-							}
-
-							// Get Data as JsonElement
+							// Process the data array
 							var dataElement = (JsonElement)data["Data"];
-
-							// Process each data item in the list
-							foreach (JsonElement item in dataElement.EnumerateArray())
-							{
-								string dataType = item.GetProperty("DataType").GetString();
-								JsonElement dataArray;
-
-								// Handle Data property which could be either a string or an array
-								if (item.TryGetProperty("Data", out dataArray))
-								{
-									// Handle the case where Data is an array
-									if (dataArray.ValueKind == JsonValueKind.Array)
-									{
-										foreach (JsonElement dataItem in dataArray.EnumerateArray())
-										{
-											// Process each data item which could be a string or an object
-											ProcessMeasurement(connection, transaction, dataItem, dataType, aggregatorId, timestamp);
-										}
-									}
-									// Handle case where Data might be a single string that needs parsing
-									else if (dataArray.ValueKind == JsonValueKind.String)
-									{
-										string dataJson = dataArray.GetString();
-										try
-										{
-											using (JsonDocument doc = JsonDocument.Parse(dataJson))
-											{
-												ProcessMeasurement(connection, transaction, doc.RootElement, dataType, aggregatorId, timestamp);
-											}
-										}
-										catch (JsonException)
-										{
-											Console.WriteLine($"[WARNING] Could not parse Data string as JSON: {dataJson}");
-										}
-									}
-								}
-								else
-								{
-									Console.WriteLine($"[WARNING] Data property not found for data type {dataType}");
-								}
-							}
+							ProcessDataArray(connection, transaction, dataElement, aggregatorId, timestamp);
 
 							transaction.Commit();
 							Console.WriteLine("[DB] Data successfully inserted into database tables.");
@@ -716,22 +659,76 @@ class Server
 		}
 	}
 
+	/// <summary>
+	/// Updates an existing Aggregator record or inserts a new one if it doesn't exist
+	/// </summary>
+	static void UpsertAggregator(SqlConnection connection, SqlTransaction transaction, string aggregatorId, DateTime timestamp)
+	{
+		string updateAggregator = @"
+        IF EXISTS (SELECT 1 FROM Aggregators WHERE AggregatorID = @id)
+            UPDATE Aggregators SET LastSeen = @ts WHERE AggregatorID = @id
+        ELSE
+            INSERT INTO Aggregators (AggregatorID, LastSeen) VALUES (@id, @ts)";
+
+		using (var cmd = new SqlCommand(updateAggregator, connection, transaction))
+		{
+			cmd.Parameters.AddWithValue("@id", aggregatorId);
+			cmd.Parameters.AddWithValue("@ts", timestamp);
+			cmd.ExecuteNonQuery();
+		}
+	}
 
 	/// <summary>
-	/// Helper method to process a measurement and insert it into the database.
+	/// Processes the array of data items from an Aggregator message
 	/// </summary>
-	/// <param name="connection">The SQL connection</param>
-	/// <param name="transaction">The SQL transaction</param>
-	/// <param name="element">The JSON element containing measurement data</param>
-	/// <param name="dataType">The type of data (e.g., "Temperature")</param>
-	/// <param name="aggregatorId">The Aggregator ID</param>
-	/// <param name="timestamp">The timestamp for the measurement</param>
+	static void ProcessDataArray(SqlConnection connection, SqlTransaction transaction,
+								JsonElement dataElement, string aggregatorId, DateTime timestamp)
+	{
+		foreach (JsonElement item in dataElement.EnumerateArray())
+		{
+			string dataType = item.GetProperty("DataType").GetString();
+
+			if (item.TryGetProperty("Data", out JsonElement dataArray))
+			{
+				if (dataArray.ValueKind == JsonValueKind.Array)
+				{
+					foreach (JsonElement dataItem in dataArray.EnumerateArray())
+					{
+						ProcessMeasurement(connection, transaction, dataItem, dataType, aggregatorId, timestamp);
+					}
+				}
+				else if (dataArray.ValueKind == JsonValueKind.String)
+				{
+					string dataJson = dataArray.GetString();
+					try
+					{
+						using (JsonDocument doc = JsonDocument.Parse(dataJson))
+						{
+							ProcessMeasurement(connection, transaction, doc.RootElement, dataType, aggregatorId, timestamp);
+						}
+					}
+					catch (JsonException)
+					{
+						Console.WriteLine($"[WARNING] Could not parse Data string as JSON: {dataJson}");
+					}
+				}
+			}
+			else
+			{
+				Console.WriteLine($"[WARNING] Data property not found for data type {dataType}");
+			}
+		}
+	}
+
+	/// <summary>
+	/// Processes a measurement data item and inserts it into the database
+	/// </summary>
 	static void ProcessMeasurement(SqlConnection connection, SqlTransaction transaction,
 								  JsonElement element, string dataType, string aggregatorId, DateTime timestamp)
 	{
 		try
 		{
-			// If element is a string, try to parse it as JSON
+			// Handle nested parsing for string-encoded JSON elements
 			if (element.ValueKind == JsonValueKind.String)
 			{
 				string json = element.GetString();
@@ -742,87 +739,22 @@ class Server
 				return;
 			}
 
-			// Extract WavyId and Value
-			string wavyId = "Unknown";
-			double value = 0;
-			bool valueFound = false;
-
-			// Extract WavyId - check different possible property names
-			if (element.TryGetProperty("WavyId", out JsonElement wavyIdElement))
+			// Extract the required data from the element
+			string wavyId = ExtractWavyId(element);
+			if (!TryExtractValue(element, out double value))
 			{
-				wavyId = wavyIdElement.GetString();
-			}
-			else if (element.TryGetProperty("wavyId", out wavyIdElement))
-			{
-				wavyId = wavyIdElement.GetString();
-			}
-
-			// Extract Value - check different possible property names and types
-			if (element.TryGetProperty("Value", out JsonElement valueElement))
-			{
-				valueFound = TryGetDoubleValue(valueElement, out value);
-			}
-			else if (element.TryGetProperty("value", out valueElement))
-			{
-				valueFound = TryGetDoubleValue(valueElement, out value);
-			}
-
-			if (!valueFound)
-			{
-				Console.WriteLine($"[WARNING] No valid value found in measurement data");
+				Console.WriteLine("[WARNING] No valid value found in measurement data");
 				return;
 			}
 
-			// Skip unknown Wavy IDs
-			if (wavyId == "Unknown")
-			{
-				Console.WriteLine($"[WARNING] No Wavy ID found for measurement, using 'Unknown'");
-			}
+			// Ensure the Wavy device exists in the database
+			EnsureWavyExists(connection, transaction, wavyId, timestamp);
 
-			// Ensure the Wavy device exists
-			string ensureWavy = @"
-            IF NOT EXISTS (SELECT 1 FROM Wavys WHERE WavyID = @id)
-                INSERT INTO Wavys (WavyID, LastSeen) VALUES (@id, @ts)
-            ELSE
-                UPDATE Wavys SET LastSeen = @ts WHERE WavyID = @id";
+			// Update or create the mapping between Wavy and Aggregator
+			UpdateWavyAggregatorMapping(connection, transaction, wavyId, aggregatorId, timestamp);
 
-			using (var cmd = new SqlCommand(ensureWavy, connection, transaction))
-			{
-				cmd.Parameters.AddWithValue("@id", wavyId);
-				cmd.Parameters.AddWithValue("@ts", timestamp);
-				cmd.ExecuteNonQuery();
-			}
-
-			// Update or insert mapping between Wavy and Aggregator
-			string updateMapping = @"
-            IF EXISTS (SELECT 1 FROM WavyAggregatorMapping WHERE WavyID = @wid AND AggregatorID = @aid)
-                UPDATE WavyAggregatorMapping SET LastConnected = @ts WHERE WavyID = @wid AND AggregatorID = @aid
-            ELSE
-                INSERT INTO WavyAggregatorMapping (WavyID, AggregatorID, FirstConnected, LastConnected) 
-                VALUES (@wid, @aid, @ts, @ts)";
-
-			using (var cmd = new SqlCommand(updateMapping, connection, transaction))
-			{
-				cmd.Parameters.AddWithValue("@wid", wavyId);
-				cmd.Parameters.AddWithValue("@aid", aggregatorId);
-				cmd.Parameters.AddWithValue("@ts", timestamp);
-				cmd.ExecuteNonQuery();
-			}
-
-			// Insert measurement
-			string insertMeasurement = @"
-            INSERT INTO Measurements (WavyID, AggregatorID, DataType, Value, Timestamp)
-            VALUES (@wid, @aid, @type, @val, @ts)";
-
-			using (var cmd = new SqlCommand(insertMeasurement, connection, transaction))
-			{
-				cmd.Parameters.AddWithValue("@wid", wavyId);
-				cmd.Parameters.AddWithValue("@aid", aggregatorId);
-				cmd.Parameters.AddWithValue("@type", dataType);
-				cmd.Parameters.AddWithValue("@val", value);
-				cmd.Parameters.AddWithValue("@ts", timestamp);
-				cmd.ExecuteNonQuery();
-			}
+			// Insert the measurement record
+			InsertMeasurement(connection, transaction, wavyId, aggregatorId, dataType, value, timestamp);
 
 			if (verboseMode)
 			{
@@ -836,11 +768,106 @@ class Server
 	}
 
 	/// <summary>
-	/// Helper method to safely extract double values from different JSON types
+	/// Extracts the Wavy ID from a measurement element
 	/// </summary>
-	/// <param name="element">The JSON element containing the value</param>
-	/// <param name="value">The extracted double value (output)</param>
-	/// <returns>True if value was successfully extracted, false otherwise</returns>
+	static string ExtractWavyId(JsonElement element)
+	{
+		if (element.TryGetProperty("WavyId", out JsonElement wavyIdElement))
+		{
+			return wavyIdElement.GetString();
+		}
+		else if (element.TryGetProperty("wavyId", out wavyIdElement))
+		{
+			return wavyIdElement.GetString();
+		}
+
+		Console.WriteLine("[WARNING] No Wavy ID found in measurement, using 'Unknown'");
+		return "Unknown";
+	}
+
+	/// <summary>
+	/// Tries to extract a numeric value from a measurement element
+	/// </summary>
+	static bool TryExtractValue(JsonElement element, out double value)
+	{
+		if (element.TryGetProperty("Value", out JsonElement valueElement))
+		{
+			return TryGetDoubleValue(valueElement, out value);
+		}
+		else if (element.TryGetProperty("value", out valueElement))
+		{
+			return TryGetDoubleValue(valueElement, out value);
+		}
+
+		value = 0;
+		return false;
+	}
+
+	/// <summary>
+	/// Ensures a Wavy device record exists in the database
+	/// </summary>
+	static void EnsureWavyExists(SqlConnection connection, SqlTransaction transaction, string wavyId, DateTime timestamp)
+	{
+		string ensureWavy = @"
+        IF NOT EXISTS (SELECT 1 FROM Wavys WHERE WavyID = @id)
+            INSERT INTO Wavys (WavyID, LastSeen) VALUES (@id, @ts)
+        ELSE
+            UPDATE Wavys SET LastSeen = @ts WHERE WavyID = @id";
+
+		using (var cmd = new SqlCommand(ensureWavy, connection, transaction))
+		{
+			cmd.Parameters.AddWithValue("@id", wavyId);
+			cmd.Parameters.AddWithValue("@ts", timestamp);
+			cmd.ExecuteNonQuery();
+		}
+	}
+
+	/// <summary>
+	/// Updates or creates a mapping between a Wavy device and an Aggregator
+	/// </summary>
+	static void UpdateWavyAggregatorMapping(SqlConnection connection, SqlTransaction transaction,
+										 string wavyId, string aggregatorId, DateTime timestamp)
+	{
+		string updateMapping = @"
+        IF EXISTS (SELECT 1 FROM WavyAggregatorMapping WHERE WavyID = @wid AND AggregatorID = @aid)
+            UPDATE WavyAggregatorMapping SET LastConnected = @ts WHERE WavyID = @wid AND AggregatorID = @aid
+        ELSE
+            INSERT INTO WavyAggregatorMapping (WavyID, AggregatorID, FirstConnected, LastConnected) 
+            VALUES (@wid, @aid, @ts, @ts)";
+
+		using (var cmd = new SqlCommand(updateMapping, connection, transaction))
+		{
+			cmd.Parameters.AddWithValue("@wid", wavyId);
+			cmd.Parameters.AddWithValue("@aid", aggregatorId);
+			cmd.Parameters.AddWithValue("@ts", timestamp);
+			cmd.ExecuteNonQuery();
+		}
+	}
+
+	/// <summary>
+	/// Inserts a measurement record into the database
+	/// </summary>
+	static void InsertMeasurement(SqlConnection connection, SqlTransaction transaction,
+							   string wavyId, string aggregatorId, string dataType, double value, DateTime timestamp)
+	{
+		string insertMeasurement = @"
+        INSERT INTO Measurements (WavyID, AggregatorID, DataType, Value, Timestamp)
+        VALUES (@wid, @aid, @type, @val, @ts)";
+
+		using (var cmd = new SqlCommand(insertMeasurement, connection, transaction))
+		{
+			cmd.Parameters.AddWithValue("@wid", wavyId);
+			cmd.Parameters.AddWithValue("@aid", aggregatorId);
+			cmd.Parameters.AddWithValue("@type", dataType);
+			cmd.Parameters.AddWithValue("@val", value);
+			cmd.Parameters.AddWithValue("@ts", timestamp);
+			cmd.ExecuteNonQuery();
+		}
+	}
+
+	/// <summary>
+	/// Extracts a double value from a JSON element, handling different types
+	/// </summary>
 	static bool TryGetDoubleValue(JsonElement element, out double value)
 	{
 		value = 0;
