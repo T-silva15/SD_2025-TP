@@ -38,7 +38,7 @@ class Server
 	/// <summary>
 	/// Flag to enable detailed logging
 	/// </summary>
-	static bool detailedLogging = false;
+	static bool verboseMode = false;
 
 	/// <summary>
 	/// Database connection string
@@ -59,6 +59,11 @@ class Server
 		// Server to Aggregator confirmation codes
 		public const int ServerConfirmation = 402;
 	}
+
+	/// <summary>
+	/// Inactivity threshold in hours before marking a device as inactive
+	/// </summary>
+	static readonly int InactivityThresholdHours = 1; // Temporary value for testing - 1 hour
 
 	#endregion
 
@@ -81,8 +86,9 @@ class Server
 		Console.WriteLine("\nAvailable Commands:");
 		Console.WriteLine("Press 'A' to show connected aggregators");
 		Console.WriteLine("Press 'D' to show database statistics");
-		Console.WriteLine("Press 'L' to toggle detailed logging");
+		Console.WriteLine("Press 'V' to toggle verbose mode");
 		Console.WriteLine("Press 'C' to modify connection string");
+		Console.WriteLine("Press 'I' to check for inactive devices");
 		Console.WriteLine("Press 'Q' to quit");
 
 		// Main server loop
@@ -130,12 +136,15 @@ class Server
 					case ConsoleKey.D:
 						ShowDatabaseStatistics();
 						break;
-					case ConsoleKey.L:
-						detailedLogging = !detailedLogging;
-						Console.WriteLine($"Detailed logging: {(detailedLogging ? "ON" : "OFF")}");
+					case ConsoleKey.V:
+						verboseMode = !verboseMode;
+						Console.WriteLine($"Verbose mode: {(verboseMode ? "ON" : "OFF")}");
 						break;
 					case ConsoleKey.C:
 						ModifyConnectionString();
+						break;
+					case ConsoleKey.I:
+						CheckInactiveDevices();
 						break;
 					case ConsoleKey.Q:
 						Console.WriteLine("Shutting down server...");
@@ -258,6 +267,146 @@ class Server
 			Console.WriteLine("Operation cancelled. Connection string not changed.");
 		}
 	}
+
+	/// <summary>
+	/// Checks for and removes inactive Aggregators and Wavys from the database
+	/// based on the defined InactivityThresholdHours threshold
+	/// </summary>
+	static void CheckInactiveDevices()
+	{
+		Console.WriteLine("\n=== Checking for Inactive Devices ===");
+		DateTime inactiveThreshold = DateTime.Now.AddHours(-InactivityThresholdHours);
+
+		Console.WriteLine($"Removing devices not seen since: {inactiveThreshold:yyyy-MM-dd HH:mm:ss}");
+		Console.WriteLine($"Inactivity threshold: {InactivityThresholdHours} hours");
+
+		lock (dbLock)
+		{
+			using (var connection = new SqlConnection(connectionString))
+			{
+				try
+				{
+					connection.Open();
+					using (var transaction = connection.BeginTransaction())
+					{
+						try
+						{
+							// Count inactive devices before deletion
+							int inactiveAggregatorsCount = 0;
+							int inactiveWavysCount = 0;
+
+							// Count inactive Aggregators
+							using (var cmd = new SqlCommand(
+								"SELECT COUNT(*) FROM Aggregators WHERE LastSeen < @threshold",
+								connection, transaction))
+							{
+								cmd.Parameters.AddWithValue("@threshold", inactiveThreshold);
+								inactiveAggregatorsCount = (int)cmd.ExecuteScalar();
+							}
+
+							// Count inactive Wavys
+							using (var cmd = new SqlCommand(
+								"SELECT COUNT(*) FROM Wavys WHERE LastSeen < @threshold",
+								connection, transaction))
+							{
+								cmd.Parameters.AddWithValue("@threshold", inactiveThreshold);
+								inactiveWavysCount = (int)cmd.ExecuteScalar();
+							}
+
+							Console.WriteLine($"Found {inactiveAggregatorsCount} inactive Aggregators and {inactiveWavysCount} inactive Wavys");
+
+							if (inactiveAggregatorsCount > 0 || inactiveWavysCount > 0)
+							{
+								Console.Write("Do you want to remove these inactive devices? (y/n): ");
+								string answer = Console.ReadLine()?.ToLower();
+
+								if (answer == "y" || answer == "yes")
+								{
+									// First, delete measurements from inactive Wavys
+									string deleteMeasurementsFromWavys = @"
+                                    DELETE FROM Measurements 
+                                    WHERE WavyID IN (SELECT WavyID FROM Wavys WHERE LastSeen < @threshold)";
+									using (var cmd = new SqlCommand(deleteMeasurementsFromWavys, connection, transaction))
+									{
+										cmd.Parameters.AddWithValue("@threshold", inactiveThreshold);
+										cmd.ExecuteNonQuery();
+									}
+
+									// Delete measurements from inactive Aggregators
+									string deleteMeasurementsFromAggregators = @"
+                                    DELETE FROM Measurements 
+                                    WHERE AggregatorID IN (SELECT AggregatorID FROM Aggregators WHERE LastSeen < @threshold)";
+									using (var cmd = new SqlCommand(deleteMeasurementsFromAggregators, connection, transaction))
+									{
+										cmd.Parameters.AddWithValue("@threshold", inactiveThreshold);
+										cmd.ExecuteNonQuery();
+									}
+
+									// Delete mappings involving inactive devices
+									string deleteMappings = @"
+                                    DELETE FROM WavyAggregatorMapping
+                                    WHERE WavyID IN (SELECT WavyID FROM Wavys WHERE LastSeen < @threshold)
+                                    OR AggregatorID IN (SELECT AggregatorID FROM Aggregators WHERE LastSeen < @threshold)";
+									using (var cmd = new SqlCommand(deleteMappings, connection, transaction))
+									{
+										cmd.Parameters.AddWithValue("@threshold", inactiveThreshold);
+										cmd.ExecuteNonQuery();
+									}
+
+									// Delete inactive Wavys
+									string deleteWavys = "DELETE FROM Wavys WHERE LastSeen < @threshold";
+									using (var cmd = new SqlCommand(deleteWavys, connection, transaction))
+									{
+										cmd.Parameters.AddWithValue("@threshold", inactiveThreshold);
+										int removedWavys = cmd.ExecuteNonQuery();
+										Console.WriteLine($"Removed {removedWavys} inactive Wavy devices");
+									}
+
+									// Delete inactive Aggregators
+									string deleteAggregators = "DELETE FROM Aggregators WHERE LastSeen < @threshold";
+									using (var cmd = new SqlCommand(deleteAggregators, connection, transaction))
+									{
+										cmd.Parameters.AddWithValue("@threshold", inactiveThreshold);
+										int removedAggregators = cmd.ExecuteNonQuery();
+										Console.WriteLine($"Removed {removedAggregators} inactive Aggregator devices");
+									}
+
+									transaction.Commit();
+									Console.WriteLine("Inactive devices successfully removed from the database.");
+								}
+								else
+								{
+									Console.WriteLine("Operation cancelled. No devices were removed.");
+									transaction.Rollback();
+								}
+							}
+							else
+							{
+								Console.WriteLine("No inactive devices found. Nothing to remove.");
+								transaction.Rollback();
+							}
+						}
+						catch (Exception ex)
+						{
+							transaction.Rollback();
+							throw new Exception($"Transaction rolled back: {ex.Message}", ex);
+						}
+					}
+				}
+				catch (Exception ex)
+				{
+					Console.WriteLine($"[ERROR] Failed to check/remove inactive devices: {ex.Message}");
+					if (ex.InnerException != null)
+					{
+						Console.WriteLine($"[ERROR] Inner exception: {ex.InnerException.Message}");
+					}
+				}
+			}
+		}
+
+		Console.WriteLine("===============================\n");
+	}
+
 
 	#endregion
 
@@ -396,7 +545,7 @@ class Server
 		string jsonData = Encoding.UTF8.GetString(buffer, 4, bytesRead - 4);
 		Console.WriteLine($"[{code}] Data received from {(aggregatorId != "Unknown" ? "Aggregator " + aggregatorId : "unknown aggregator")}");
 
-		if (detailedLogging)
+		if (verboseMode)
 		{
 			Console.WriteLine($"[DATA] {jsonData}");
 		}
@@ -417,7 +566,7 @@ class Server
 		catch (Exception ex)
 		{
 			Console.WriteLine($"[ERROR] Failed to process data: {ex.Message}");
-			if (detailedLogging && ex.InnerException != null)
+			if (verboseMode && ex.InnerException != null)
 			{
 				Console.WriteLine($"[ERROR] Inner exception: {ex.InnerException.Message}");
 			}
@@ -654,7 +803,7 @@ class Server
 				cmd.ExecuteNonQuery();
 			}
 
-			if (detailedLogging)
+			if (verboseMode)
 			{
 				Console.WriteLine($"[DB] Measurement saved: WavyID={wavyId}, Type={dataType}, Value={value}");
 			}

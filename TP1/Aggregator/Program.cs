@@ -54,8 +54,8 @@ class Aggregator
 
 		// Timeouts and intervals
 		public static int ConfirmationTimeoutMs { get; private set; } = 10000; // 10 seconds
-		public static int DataTransmissionIntervalSec { get; private set; } = 10; // 10 seconds (TEMP VALUE)
-		public static int RetryIntervalSec { get; private set; } = 3; // 3 seconds (TEMP VALUE)
+		public static int DataTransmissionIntervalSec { get; private set; } = 30; // 30 seconds (TEMP VALUE)
+		public static int RetryIntervalSec { get; private set; } = 3; // 5 seconds (TEMP VALUE)
 		public static int MaxRetryAttempts { get; private set; } = 5;
 		public static int ClientPollIntervalMs { get; private set; } = 100;
 
