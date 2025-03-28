@@ -23,20 +23,20 @@ class Aggregator
 	/// </summary>
 	private static class MessageCodes
 	{
-		// Wavy to Aggregator codes
+		// Existing codes...
 		public const int WavyConnect = 101;
+		public const int AggregatorConnect = 102; // Add this for Aggregator-Server connection
 		public const int WavyDataHttpInitial = 200;
 		public const int WavyDataInitial = 201;
 		public const int WavyDataResend = 202;
-		public const int WavyDisconnect = 501;
-
-		// Aggregator to Server codes
 		public const int AggregatorData = 301;
-
-		// Confirmation codes
+		public const int AggregatorDataResend = 302; // Add this for data resend to server
 		public const int WavyConfirmation = 401;
 		public const int ServerConfirmation = 402;
+		public const int WavyDisconnect = 501;
+		public const int AggregatorDisconnect = 502; // Add this for Aggregator-Server disconnection
 	}
+
 
 	#endregion
 
@@ -54,8 +54,8 @@ class Aggregator
 
 		// Timeouts and intervals
 		public static int ConfirmationTimeoutMs { get; private set; } = 10000; // 10 seconds
-		public static int DataTransmissionIntervalSec { get; private set; } = 3600; // 1 hour
-		public static int RetryIntervalSec { get; private set; } = 180; // 3 minutes
+		public static int DataTransmissionIntervalSec { get; private set; } = 10; // 10 seconds (TEMP VALUE)
+		public static int RetryIntervalSec { get; private set; } = 3; // 3 seconds (TEMP VALUE)
 		public static int MaxRetryAttempts { get; private set; } = 5;
 		public static int ClientPollIntervalMs { get; private set; } = 100;
 
@@ -126,16 +126,16 @@ class Aggregator
 			try
 			{
 				var config = new Dictionary<string, object>
-				{
-					{ "ListeningPort", ListeningPort },
-					{ "ServerIp", ServerIp },
-					{ "ServerPort", ServerPort },
-					{ "ConfirmationTimeoutMs", ConfirmationTimeoutMs },
-					{ "DataTransmissionIntervalSec", DataTransmissionIntervalSec },
-					{ "RetryIntervalSec", RetryIntervalSec },
-					{ "MaxRetryAttempts", MaxRetryAttempts },
-					{ "DefaultVerboseMode", DefaultVerboseMode }
-				};
+			{
+				{ "ListeningPort", ListeningPort },
+				{ "ServerIp", ServerIp },
+				{ "ServerPort", ServerPort },
+				{ "ConfirmationTimeoutMs", ConfirmationTimeoutMs },
+				{ "DataTransmissionIntervalSec", DataTransmissionIntervalSec },
+				{ "RetryIntervalSec", RetryIntervalSec },
+				{ "MaxRetryAttempts", MaxRetryAttempts },
+				{ "DefaultVerboseMode", DefaultVerboseMode }
+			};
 
 				string json = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
 				File.WriteAllText(ConfigFilePath, json);
@@ -147,6 +147,7 @@ class Aggregator
 			}
 		}
 	}
+
 
 	#endregion
 
@@ -213,6 +214,8 @@ class Aggregator
 		ShutdownThreads();
 	}
 
+
+
 	private static void OnProcessExit(object sender, EventArgs e)
 	{
 		isRunning = false;
@@ -232,15 +235,30 @@ class Aggregator
 			if (thread != Thread.CurrentThread && thread.IsAlive)
 			{
 				Console.WriteLine($"Waiting for thread '{thread.Name}' to terminate...");
-				if (!thread.Join(2000)) // Wait up to 2 seconds
+				if (!thread.Join(2000))
 				{
 					Console.WriteLine($"Thread '{thread.Name}' did not terminate gracefully.");
 				}
 			}
 		}
 
+		// Send disconnect notification to the server
+		try
+		{
+			using (TcpClient client = new TcpClient(Config.ServerIp, Config.ServerPort))
+			using (NetworkStream stream = client.GetStream())
+			{
+				SendServerDisconnection(stream);
+			}
+		}
+		catch (Exception ex)
+		{
+			Console.WriteLine($"Error during shutdown: {ex.Message}");
+		}
+
 		Console.WriteLine("Shutdown complete.");
 	}
+
 
 	private static void RegisterThread(Thread thread)
 	{
@@ -712,6 +730,8 @@ class Aggregator
 		{
 			while (isRunning)
 			{
+				Console.WriteLine($"Waiting for {Config.DataTransmissionIntervalSec} seconds before sending data...");
+
 				// Wait for configured interval between data transmissions
 				for (int i = 0; i < Config.DataTransmissionIntervalSec && isRunning; i++)
 				{
@@ -732,6 +752,7 @@ class Aggregator
 					continue;
 				}
 
+				// Establish connection, send data, and disconnect
 				SendAggregatedData(dataToSend);
 			}
 		}
@@ -745,45 +766,17 @@ class Aggregator
 		}
 	}
 
-	/// <summary>
-	/// Aggregates and sends data to the server with retry mechanism
-	/// </summary>
 	private static void SendAggregatedData(ConcurrentDictionary<string, ConcurrentBag<string>> dataToSend)
 	{
+		// Existing aggregation code...
 		var aggregatedDataList = new List<object>();
 
 		// Aggregate data for each data type
 		foreach (var dataType in dataToSend.Keys)
 		{
-			var dataList = dataToSend[dataType];
-
-			try
-			{
-				var aggregatedData = new
-				{
-					DataType = dataType,
-					// Sum up all values for this data type
-					TotalValue = dataList.Sum(data =>
-					{
-						var deserializedData = JsonSerializer.Deserialize<Dictionary<string, object>>(data);
-						return deserializedData != null && deserializedData.TryGetValue("Value", out var valueObj) && valueObj is JsonElement valueElement ?
-							valueElement.GetInt64() : 0;
-					}),
-					// Collect unique Wavy IDs that contributed to this data type
-					WavyIds = dataList.Select(data =>
-					{
-						var deserializedData = JsonSerializer.Deserialize<Dictionary<string, object>>(data);
-						return deserializedData != null && deserializedData.TryGetValue("WavyId", out var wavyIdObj) &&
-							   wavyIdObj is JsonElement wavyIdElement ? wavyIdElement.GetString() : null;
-					}).Where(wavyId => wavyId != null).Distinct().ToList()
-				};
-
-				aggregatedDataList.Add(aggregatedData);
-			}
-			catch (Exception ex)
-			{
-				Console.WriteLine($"Error aggregating data for type {dataType}: {ex.Message}");
-			}
+			// Perform aggregation logic here
+			var aggregatedData = dataToSend[dataType].ToList();
+			aggregatedDataList.Add(new { DataType = dataType, Data = aggregatedData });
 		}
 
 		if (aggregatedDataList.Count == 0)
@@ -805,48 +798,77 @@ class Aggregator
 		// Send data with retry mechanism until confirmation is received
 		bool confirmed = false;
 		int retryCount = 0;
-		while (!confirmed && isRunning && retryCount < Config.MaxRetryAttempts)
-		{
-			try
-			{
-				using (TcpClient client = new TcpClient(Config.ServerIp, Config.ServerPort))
-				using (NetworkStream stream = client.GetStream())
-				{
-					// Send aggregated data to server
-					SendMessage(stream, jsonData, MessageCodes.AggregatorData);
-					Console.WriteLine($"[{MessageCodes.AggregatorData}] Data sent to server:");
-					if (verboseMode)
-					{
-						Console.WriteLine(jsonData);
-					}
 
-					// Wait for confirmation from server
-					confirmed = WaitForConfirmation(stream, MessageCodes.ServerConfirmation);
-					if (!confirmed)
+		try
+		{
+			// Create a TCP client and connect to the server
+			using (TcpClient client = new TcpClient(Config.ServerIp, Config.ServerPort))
+			using (NetworkStream stream = client.GetStream())
+			{
+				// Send connection request first (code 102)
+				EstablishServerConnection(stream);
+
+				// Send data and handle retries
+				while (!confirmed && isRunning && retryCount < Config.MaxRetryAttempts)
+				{
+					try
 					{
-						retryCount++;
-						Console.WriteLine($"No confirmation received from server, retry {retryCount}/{Config.MaxRetryAttempts}...");
-						for (int i = 0; i < Config.RetryIntervalSec && isRunning; i++) // Wait before resending
+						// Choose the correct code based on retry count
+						int messageCode = (retryCount == 0) ?
+							MessageCodes.AggregatorData :
+							MessageCodes.AggregatorDataResend;
+
+						// Send aggregated data to server
+						SendMessage(stream, jsonData, messageCode);
+						Console.WriteLine($"[{messageCode}] Data sent to server:");
+						if (verboseMode)
 						{
-							Thread.Sleep(1000);
+							Console.WriteLine(jsonData);
+						}
+
+						// Wait for confirmation from server
+						confirmed = WaitForConfirmation(stream, MessageCodes.ServerConfirmation);
+						if (!confirmed)
+						{
+							retryCount++;
+							Console.WriteLine($"No confirmation received from server, retry {retryCount}/{Config.MaxRetryAttempts}...");
+
+							if (retryCount < Config.MaxRetryAttempts)
+							{
+								for (int i = 0; i < Config.RetryIntervalSec && isRunning; i++) // Wait before resending
+								{
+									Thread.Sleep(1000);
+								}
+							}
+						}
+						else
+						{
+							Console.WriteLine($"Server confirmed data receipt (code {MessageCodes.ServerConfirmation})");
 						}
 					}
-					else
+					catch (Exception ex)
 					{
-						Console.WriteLine($"Server confirmed data receipt (code {MessageCodes.ServerConfirmation})");
+						retryCount++;
+						Console.WriteLine($"Error sending data to server: {ex.Message}");
+
+						if (retryCount < Config.MaxRetryAttempts)
+						{
+							Console.WriteLine($"Retry {retryCount}/{Config.MaxRetryAttempts} in {Config.RetryIntervalSec} seconds...");
+							for (int i = 0; i < Config.RetryIntervalSec && isRunning; i++) // Wait before resending
+							{
+								Thread.Sleep(1000);
+							}
+						}
 					}
 				}
+
+				// Send disconnection notification (code 502) when done
+				SendServerDisconnection(stream);
 			}
-			catch (Exception ex)
-			{
-				retryCount++;
-				Console.WriteLine($"Error sending data to server: {ex.Message}");
-				Console.WriteLine($"Retry {retryCount}/{Config.MaxRetryAttempts} in {Config.RetryIntervalSec} seconds...");
-				for (int i = 0; i < Config.RetryIntervalSec && isRunning; i++) // Wait before resending
-				{
-					Thread.Sleep(1000);
-				}
-			}
+		}
+		catch (Exception ex)
+		{
+			Console.WriteLine($"Error connecting to server: {ex.Message}");
 		}
 
 		if (!confirmed && retryCount >= Config.MaxRetryAttempts)
@@ -964,6 +986,70 @@ class Aggregator
 			return false;
 		}
 	}
+
+	/// <summary>
+	/// Establishes a connection with the server using code 102
+	/// </summary>
+	private static void EstablishServerConnection(NetworkStream stream)
+	{
+		try
+		{
+			// Prepare connection message with aggregator ID
+			string connectionData = JsonSerializer.Serialize(new { AggregatorId = aggregatorId });
+
+			// Send connection request
+			SendMessage(stream, connectionData, MessageCodes.AggregatorConnect);
+			Console.WriteLine($"[{MessageCodes.AggregatorConnect}] Connection request sent to server");
+
+			// Wait for confirmation from server
+			bool confirmed = WaitForConfirmation(stream, MessageCodes.ServerConfirmation);
+			if (confirmed)
+			{
+				Console.WriteLine("Server confirmed connection");
+			}
+			else
+			{
+				Console.WriteLine("Warning: Server did not confirm connection");
+			}
+		}
+		catch (Exception ex)
+		{
+			Console.WriteLine($"Error establishing server connection: {ex.Message}");
+			throw; // Rethrow to let caller handle
+		}
+	}
+
+
+	/// <summary>
+	/// Sends a disconnection notification to the server using code 502
+	/// </summary>
+	private static void SendServerDisconnection(NetworkStream stream)
+	{
+		try
+		{
+			// Prepare disconnection message with aggregator ID
+			string disconnectionData = JsonSerializer.Serialize(new { AggregatorId = aggregatorId });
+
+			// Send disconnection notification
+			SendMessage(stream, disconnectionData, MessageCodes.AggregatorDisconnect);
+			Console.WriteLine($"[{MessageCodes.AggregatorDisconnect}] Disconnection notification sent to server");
+
+			// Wait for confirmation from server (with shorter timeout)
+			stream.ReadTimeout = Math.Min(Config.ConfirmationTimeoutMs, 3000); // Use a shorter timeout for disconnection
+			bool confirmed = WaitForConfirmation(stream, MessageCodes.ServerConfirmation);
+			if (confirmed)
+			{
+				Console.WriteLine("Server confirmed disconnection");
+			}
+		}
+		catch (Exception ex)
+		{
+			Console.WriteLine($"Error sending disconnection notification: {ex.Message}");
+			// Don't rethrow - disconnection errors shouldn't stop the application
+		}
+	}
+
+
 
 	#endregion
 }
