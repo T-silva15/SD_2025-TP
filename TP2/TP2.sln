@@ -9,8 +9,6 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Server", "Server\Server.csp
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Aggregator", "Aggregator\Aggregator.csproj", "{0F22DA20-72FA-414E-8407-F2A509378662}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "WavyTmp1", "WavyTmp1\WavyTmp1.csproj", "{59626357-8B97-49F7-887B-629F96E3868C}"
-EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -29,10 +27,6 @@ Global
 		{0F22DA20-72FA-414E-8407-F2A509378662}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{0F22DA20-72FA-414E-8407-F2A509378662}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{0F22DA20-72FA-414E-8407-F2A509378662}.Release|Any CPU.Build.0 = Release|Any CPU
-		{59626357-8B97-49F7-887B-629F96E3868C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{59626357-8B97-49F7-887B-629F96E3868C}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{59626357-8B97-49F7-887B-629F96E3868C}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{59626357-8B97-49F7-887B-629F96E3868C}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
