@@ -1,0 +1,31 @@
+// ocean_monitor.proto
+syntax = "proto3";
+
+package oceanmonitor;
+
+// Service definition for Ocean data calculations
+service DataCalculationService {
+  // Send data for calculation and receive calculated metrics
+  rpc CalculateMetrics (DataCalculationRequest) returns (DataCalculationResponse);
+}
+
+// The request message containing sensor data for calculation
+message DataCalculationRequest {
+  string wavy_id = 1;
+  string data_type = 2;
+  double value = 3;
+  int64 timestamp = 4;
+}
+
+// The response message containing calculated metrics
+message DataCalculationResponse {
+  string wavy_id = 1;
+  string data_type = 2;
+  double original_value = 3;
+  double average_value = 4;
+  double variance = 5;
+  double trend_coefficient = 6;
+  double normalized_value = 7;
+  double anomaly_score = 8;
+  int64 timestamp = 9;
+}
