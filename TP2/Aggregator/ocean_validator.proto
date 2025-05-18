@@ -1,0 +1,47 @@
+// ocean_validator.proto
+syntax = "proto3";
+
+package oceanmonitor;
+
+// Service for data validation and cleaning
+service DataValidationService {
+  // Validates and cleans data from Wavy devices
+  rpc ValidateData (ValidationRequest) returns (ValidationResponse);
+}
+
+// Request containing data to be validated
+message ValidationRequest {
+  string wavy_id = 1;           // Unique identifier for the Wavy device
+  repeated DataItem data = 2;   // Array of data measurements
+}
+
+// Individual data measurement
+message DataItem {
+  string data_type = 1;         // Type of measurement (e.g., "Temperature", "Frequency")
+  double value = 2;             // Measurement value
+  int64 timestamp = 3;          // Unix timestamp in milliseconds
+}
+
+// Response containing validation results and cleaned data
+message ValidationResponse {
+  enum Status {
+    OK = 0;                     // Data is valid or was successfully cleaned
+    INVALID = 1;                // Data contains errors that couldn't be fixed
+    PARTIALLY_VALID = 2;        // Some data items were valid, others were invalid
+  }
+  
+  Status status = 1;                // Overall status of the validation
+  string wavy_id = 2;               // Echo of the Wavy ID from the request
+  repeated CleanedDataItem data = 3; // Cleaned/validated data items
+  string message = 4;               // Human-readable message about the validation
+}
+
+// Cleaned data item with additional validation metadata
+message CleanedDataItem {
+  string data_type = 1;         // Type of measurement
+  double original_value = 2;    // Original value from the request
+  double cleaned_value = 3;     // Cleaned/corrected value (same as original if no cleaning needed)
+  bool was_modified = 4;        // Whether the value was modified during cleaning
+  string validation_message = 5; // Details about any corrections made
+  int64 timestamp = 6;          // Unix timestamp in milliseconds
+}

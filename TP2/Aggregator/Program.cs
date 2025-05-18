@@ -1,4 +1,5 @@
-﻿using System;
+﻿using OceanMonitorSystem;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -36,6 +37,7 @@ class Aggregator
 		public const int AggregatorDataResend = 302;
 		public const int AggregatorDisconnect = 502;
 		public const int ServerConfirmation = 402;
+
 	}
 
 	#endregion
@@ -51,6 +53,8 @@ class Aggregator
 		public static int ListeningPort { get; private set; } = 5000;
 		public static string ServerIp { get; private set; } = "127.0.0.1";
 		public static int ServerPort { get; private set; } = 6000;
+		public static readonly string VALIDATION_SERVER_ADDRESS = "http://localhost:50052";
+		public static DataValidationClient _validationClient;
 
 		// Timeouts and intervals
 		public static int ConfirmationTimeoutMs { get; private set; } = 10000;
@@ -74,6 +78,10 @@ class Aggregator
 		static Config()
 		{
 			LoadConfigFromFile();
+
+
+			// Initialize the validation client
+			_validationClient = new DataValidationClient(VALIDATION_SERVER_ADDRESS, DefaultVerboseMode);
 		}
 
 		/// <summary>
@@ -616,7 +624,7 @@ class Aggregator
 	/// Handles communication with a connected Wavy client
 	/// </summary>
 	/// <param name="client">The TCP client to handle</param>
-	private static void HandleClient(TcpClient client)
+	private static async void HandleClient(TcpClient client)
 	{
 		string clientIp = "Unknown";
 
@@ -655,15 +663,19 @@ class Aggregator
 					if (messageCode == MessageCodes.WavyDataHttpInitial)
 						isHttpLikeRequest = true;
 
-					// Process message based on code
-					ProcessMessage(buffer, bytesRead, stream, messageCode);
+					// Process message based on code and await the result
+					await ProcessMessageAsync(buffer, bytesRead, stream, messageCode);
 
 					// Handle disconnection
 					if (messageCode == MessageCodes.WavyDisconnect)
 						return;
 
-					// Send confirmation for all messages
+					// Send confirmation for all messages (after processing is complete)
 					SendConfirmation(stream, MessageCodes.WavyConfirmation);
+
+					// For HTTP-like requests, after sending confirmation, we break from the loop
+					if (isHttpLikeRequest)
+						break;
 				}
 			}
 		}
@@ -679,13 +691,13 @@ class Aggregator
 	}
 
 	/// <summary>
-	/// Processes a message based on its code
+	/// Processes a message based on its code asynchronously
 	/// </summary>
 	/// <param name="buffer">The received data buffer</param>
 	/// <param name="bytesRead">Number of bytes read from the buffer</param>
 	/// <param name="stream">The network stream for response</param>
 	/// <param name="messageCode">The message code identifying the type of message</param>
-	private static void ProcessMessage(byte[] buffer, int bytesRead, NetworkStream stream, int messageCode)
+	private static async Task ProcessMessageAsync(byte[] buffer, int bytesRead, NetworkStream stream, int messageCode)
 	{
 		switch (messageCode)
 		{
@@ -695,7 +707,7 @@ class Aggregator
 			case MessageCodes.WavyDataHttpInitial:
 			case MessageCodes.WavyDataInitial:
 			case MessageCodes.WavyDataResend:
-				ProcessData(buffer, bytesRead, stream, messageCode);
+				await ProcessDataAsync(buffer, bytesRead, stream, messageCode);
 				break;
 			case MessageCodes.AggregatorData:
 				ProcessAggregatedData(buffer, bytesRead, stream);
@@ -706,6 +718,54 @@ class Aggregator
 			default:
 				LogUnknownMessage(buffer, bytesRead, messageCode);
 				break;
+		}
+	}
+
+	/// <summary>
+	/// Processes data sent from a Wavy client with validation
+	/// </summary>
+	private static async Task ProcessDataAsync(byte[] buffer, int bytesRead, NetworkStream stream, int messageCode)
+	{
+		string jsonData = Encoding.UTF8.GetString(buffer, 4, bytesRead - 4);
+		string wavyId = "Unknown";
+
+		try
+		{
+			using (JsonDocument doc = JsonDocument.Parse(jsonData))
+			{
+				JsonElement root = doc.RootElement;
+
+				// Extract Wavy ID
+				if (root.TryGetProperty("WavyId", out JsonElement wavyIdElement))
+				{
+					wavyId = wavyIdElement.GetString();
+				}
+
+				Console.WriteLine($"[{messageCode}] Data received from Wavy ID: {wavyId}");
+
+				// Validate and clean data using remote service
+				var (isValid, cleanedData) = await Config._validationClient.ValidateAndCleanDataAsync(wavyId, jsonData);
+
+				if (!isValid)
+				{
+					Console.WriteLine($"[WARNING] Validation failed for data from Wavy ID: {wavyId}");
+					return;
+				}
+
+				// Use the cleaned data instead of the original
+				jsonData = cleanedData;
+			}
+
+			// Store the cleaned data in the data store
+			StoreInDataStore(jsonData);
+		}
+		catch (Exception ex)
+		{
+			Console.WriteLine($"Error processing data: {ex.Message}");
+			if (verboseMode)
+			{
+				Console.WriteLine($"Raw data: {jsonData}");
+			}
 		}
 	}
 
@@ -764,17 +824,9 @@ class Aggregator
 		Console.WriteLine($"Wavy disconnection request from ID: {wavyId}");
 	}
 
-	/// <summary>
-	/// Processes data sent from a Wavy client
-	/// </summary>
-	/// <param name="buffer">The received data buffer</param>
-	/// <param name="bytesRead">Number of bytes read from the buffer</param>
-	/// <param name="stream">The network stream for response</param>
-	/// <param name="messageCode">The message code for this data</param>
-	private static void ProcessData(byte[] buffer, int bytesRead, NetworkStream stream, int messageCode)
+	// Helper method to store data in the data store
+	private static void StoreInDataStore(string jsonData)
 	{
-		string jsonData = Encoding.UTF8.GetString(buffer, 4, bytesRead - 4);
-
 		try
 		{
 			using (JsonDocument doc = JsonDocument.Parse(jsonData))
@@ -789,12 +841,6 @@ class Aggregator
 				}
 
 				string wavyId = root.GetProperty("WavyId").GetString();
-				Console.WriteLine($"[{messageCode}] Data received from Wavy ID: {wavyId}");
-
-				if (verboseMode)
-				{
-					Console.WriteLine("Sensor Data:");
-				}
 
 				// Store each data item
 				foreach (JsonElement item in root.GetProperty("Data").EnumerateArray())
@@ -805,11 +851,7 @@ class Aggregator
 		}
 		catch (Exception ex)
 		{
-			Console.WriteLine($"Error parsing JSON data: {ex.Message}");
-			if (verboseMode)
-			{
-				Console.WriteLine($"Raw data: {jsonData}");
-			}
+			Console.WriteLine($"Error storing cleaned data: {ex.Message}");
 		}
 	}
 
