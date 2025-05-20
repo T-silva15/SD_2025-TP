@@ -9,35 +9,29 @@ using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
+using NetMQ;
+using NetMQ.Sockets;
 
 /// <summary>
-/// Middle-tier component of the OceanMonitor system that collects data from Wavy clients,
-/// aggregates it by data type, and periodically forwards it to the central server.
+/// Middle-tier component of the OceanMonitor system that collects data from Wavy clients 
+/// through ZeroMQ publish-subscribe mechanism, aggregates it by data type, and 
+/// periodically forwards it to the central server.
 /// </summary>
 class Aggregator
 {
 	#region Protocol Constants
 
 	/// <summary>
-	/// Message codes used in the communication protocol 
+	/// Message codes used in the communication protocol with the server
 	/// </summary>
 	private static class MessageCodes
 	{
-		// Wavy-Aggregator communication codes
-		public const int WavyConnect = 101;
-		public const int WavyDataHttpInitial = 200;
-		public const int WavyDataInitial = 201;
-		public const int WavyDataResend = 202;
-		public const int WavyDisconnect = 501;
-		public const int WavyConfirmation = 401;
-
 		// Aggregator-Server communication codes
 		public const int AggregatorConnect = 102;
 		public const int AggregatorData = 301;
 		public const int AggregatorDataResend = 302;
 		public const int AggregatorDisconnect = 502;
 		public const int ServerConfirmation = 402;
-
 	}
 
 	#endregion
@@ -49,12 +43,11 @@ class Aggregator
 	/// </summary>
 	private static class Config
 	{
-		// Network settings
-		public static int ListeningPort { get; private set; } = 5000;
+		// Server connection settings
 		public static string ServerIp { get; private set; } = "127.0.0.1";
 		public static int ServerPort { get; private set; } = 6000;
 		public static readonly string VALIDATION_SERVER_ADDRESS = "http://localhost:50052";
-		public static DataValidationClient _validationClient;
+		public static DataValidationClient _validationClient = null!;
 
 		// Timeouts and intervals
 		public static int ConfirmationTimeoutMs { get; private set; } = 10000;
@@ -67,10 +60,17 @@ class Aggregator
 		public static int ReceiveBufferSize { get; private set; } = 4096;
 
 		// Debug settings
-		public static bool DefaultVerboseMode { get; private set; } = false;
+		public static bool VerboseMode { get; private set; } = false;
 
 		// File path for configuration
 		private static readonly string ConfigFilePath = "aggregator.config.json";
+
+		// Default data types to subscribe to
+		public static readonly List<string> DefaultSubscribedDataTypes = new List<string>
+		{
+			"Temperature",
+			"Frequency"
+		};
 
 		/// <summary>
 		/// Static constructor that loads configuration from file if available
@@ -79,9 +79,8 @@ class Aggregator
 		{
 			LoadConfigFromFile();
 
-
 			// Initialize the validation client
-			_validationClient = new DataValidationClient(VALIDATION_SERVER_ADDRESS, DefaultVerboseMode);
+			_validationClient = new DataValidationClient(VALIDATION_SERVER_ADDRESS, VerboseMode);
 		}
 
 		/// <summary>
@@ -115,11 +114,8 @@ class Aggregator
 		/// </summary>
 		private static void ApplyConfigValues(Dictionary<string, object> config)
 		{
-			if (TryGetJsonValue(config, "ListeningPort", out JsonElement portValue) && portValue.ValueKind == JsonValueKind.Number)
-				ListeningPort = portValue.GetInt32();
-
 			if (TryGetJsonValue(config, "ServerIp", out JsonElement ipValue) && ipValue.ValueKind == JsonValueKind.String)
-				ServerIp = ipValue.GetString();
+				ServerIp = ipValue.GetString() ?? "127.0.0.1";
 
 			if (TryGetJsonValue(config, "ServerPort", out JsonElement serverPortValue) && serverPortValue.ValueKind == JsonValueKind.Number)
 				ServerPort = serverPortValue.GetInt32();
@@ -136,12 +132,12 @@ class Aggregator
 			if (TryGetJsonValue(config, "MaxRetryAttempts", out JsonElement maxRetryValue) && maxRetryValue.ValueKind == JsonValueKind.Number)
 				MaxRetryAttempts = maxRetryValue.GetInt32();
 
-			if (TryGetJsonValue(config, "DefaultVerboseMode", out JsonElement verboseValue))
+			if (TryGetJsonValue(config, "VerboseMode", out JsonElement verboseValue))
 			{
 				if (verboseValue.ValueKind == JsonValueKind.True)
-					DefaultVerboseMode = true;
+					VerboseMode = true;
 				else if (verboseValue.ValueKind == JsonValueKind.False)
-					DefaultVerboseMode = false;
+					VerboseMode = false;
 			}
 		}
 
@@ -168,14 +164,13 @@ class Aggregator
 			{
 				var config = new Dictionary<string, object>
 				{
-					{ "ListeningPort", ListeningPort },
 					{ "ServerIp", ServerIp },
 					{ "ServerPort", ServerPort },
 					{ "ConfirmationTimeoutMs", ConfirmationTimeoutMs },
 					{ "DataTransmissionIntervalSec", DataTransmissionIntervalSec },
 					{ "RetryIntervalSec", RetryIntervalSec },
 					{ "MaxRetryAttempts", MaxRetryAttempts },
-					{ "DefaultVerboseMode", DefaultVerboseMode }
+					{ "VerboseMode", VerboseMode }
 				};
 
 				string json = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
@@ -210,6 +205,24 @@ class Aggregator
 			{
 				Console.WriteLine($"Error deleting configuration file: {ex.Message}");
 			}
+
+			try
+			{
+				if (File.Exists(PubSubConfig.SubscriptionFilePath))
+				{
+					File.Delete(PubSubConfig.SubscriptionFilePath);
+					Console.WriteLine("Subscription file deleted successfully.");
+					Console.WriteLine("Default settings will be used on next restart.");
+				}
+				else
+				{
+					Console.WriteLine("Subscription file does not exist.");
+				}
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"Error deleting subscription file: {ex.Message}");
+			}
 		}
 	}
 
@@ -228,12 +241,8 @@ class Aggregator
 	private static readonly ConcurrentDictionary<Thread, DateTime> activeThreads =
 		new ConcurrentDictionary<Thread, DateTime>();
 
-	// Registry of connected Wavy devices
-	private static readonly Dictionary<string, DateTime> connectedWavys =
-		new Dictionary<string, DateTime>();
-
 	// Detailed logging control
-	private static bool verboseMode = Config.DefaultVerboseMode;
+	private static bool verboseMode = Config.VerboseMode;
 
 	// Application lifecycle control
 	private static bool isRunning = true;
@@ -247,10 +256,10 @@ class Aggregator
 	/// </summary>
 	public static void Main(string[] args)
 	{
-		AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
+		AppDomain.CurrentDomain.ProcessExit += (sender, e) => OnProcessExit(sender!, e);
 
 		Console.WriteLine($"Aggregator {aggregatorId} starting...");
-		Console.WriteLine($"Listening on port {Config.ListeningPort}, sending to {Config.ServerIp}:{Config.ServerPort}");
+		Console.WriteLine($"Receiving data via ZeroMQ, sending to {Config.ServerIp}:{Config.ServerPort}");
 		DisplayCommandMenu();
 
 		InitializeThreads();
@@ -271,11 +280,11 @@ class Aggregator
 	{
 		Console.WriteLine("\nAvailable Commands:");
 		Console.WriteLine("Press 'V' to toggle verbose mode");
-		Console.WriteLine("Press 'C' to show currently connected Wavy clients");
 		Console.WriteLine("Press 'D' to show current data store");
 		Console.WriteLine("Press 'T' to show active threads");
+		Console.WriteLine("Press 'M' to manage subscriptions");
 		Console.WriteLine("Press 'S' to save current configuration");
-		Console.WriteLine("Press 'X' to delete configuration file");
+		Console.WriteLine("Press 'X' to delete configuration and subscription files");
 		Console.WriteLine("Press 'W' to clear screen");
 		Console.WriteLine("Press 'Q' to quit");
 	}
@@ -285,15 +294,13 @@ class Aggregator
 	/// </summary>
 	private static void InitializeThreads()
 	{
+		// Initialize ZeroMQ subscriber and load subscriptions
+		PubSubConfig.LoadSubscriptions();
+
 		// Start keyboard monitoring thread
 		Thread keyboardThread = new Thread(MonitorKeyboard) { IsBackground = true, Name = "KeyboardMonitor" };
 		RegisterThread(keyboardThread);
 		keyboardThread.Start();
-
-		// Start listener thread for Wavy connections
-		Thread listenerThread = new Thread(StartListener) { Name = "WavyListener" };
-		RegisterThread(listenerThread);
-		listenerThread.Start();
 
 		// Start data sender thread for server communication
 		Thread senderThread = new Thread(SendDataToServer) { Name = "ServerSender" };
@@ -321,6 +328,10 @@ class Aggregator
 
 		WaitForThreadsToTerminate();
 		SendFinalServerDisconnection();
+
+		// Cleanup ZeroMQ resources
+		PubSubConfig.Cleanup();
+		NetMQConfig.Cleanup();
 
 		Console.WriteLine("Shutdown complete.");
 	}
@@ -422,9 +433,6 @@ class Aggregator
 				verboseMode = !verboseMode;
 				Console.WriteLine($"Verbose mode: {(verboseMode ? "ON" : "OFF")}");
 				break;
-			case ConsoleKey.C:
-				ShowConnectedClients();
-				break;
 			case ConsoleKey.D:
 				ShowDataStore();
 				break;
@@ -436,6 +444,9 @@ class Aggregator
 				break;
 			case ConsoleKey.X:
 				Config.DeleteConfigFile();
+				break;
+			case ConsoleKey.M:
+				ManageSubscriptions();
 				break;
 			case ConsoleKey.Q:
 				Console.WriteLine("Shutting down aggregator...");
@@ -450,29 +461,115 @@ class Aggregator
 	}
 
 	/// <summary>
-	/// Displays information about connected Wavy clients
+	/// Manages subscription settings through the console UI
 	/// </summary>
-	private static void ShowConnectedClients()
+	private static void ManageSubscriptions()
 	{
-		Console.WriteLine("\n=== Connected Wavy Clients ===");
-		lock (connectedWavys)
+		Console.WriteLine("\n=== Subscription Management ===");
+		Console.WriteLine("Currently subscribed data types:");
+
+		int index = 1;
+		var dataTypes = new Dictionary<int, string>();
+
+		foreach (var dataType in PubSubConfig.SubscribedDataTypes)
 		{
-			if (connectedWavys.Count == 0)
+			Console.WriteLine($"{index}. {dataType}");
+			dataTypes[index++] = dataType;
+		}
+
+		Console.WriteLine("\nAvailable actions:");
+		Console.WriteLine("A. Add a subscription");
+		Console.WriteLine("R. Remove a subscription");
+		Console.WriteLine("B. Back to main menu");
+
+		Console.Write("\nEnter your choice: ");
+		var key = Console.ReadKey().KeyChar;
+		Console.WriteLine();
+
+		switch (char.ToUpper(key))
+		{
+			case 'A':
+				AddSubscription();
+				break;
+			case 'R':
+				RemoveSubscription(dataTypes);
+				break;
+			case 'B':
+				return;
+		}
+
+		Console.WriteLine("===========================\n");
+	}
+
+	/// <summary>
+	/// UI for adding a new subscription
+	/// </summary>
+	private static void AddSubscription()
+	{
+		// List of valid data types that can be subscribed to
+		var validDataTypes = new List<string> { "Temperature", "WindSpeed", "Frequency", "Decibels" };
+
+		Console.WriteLine("\nAvailable data types:");
+		for (int i = 0; i < validDataTypes.Count; i++)
+		{
+			Console.WriteLine($"{i + 1}. {validDataTypes[i]}");
+		}
+
+		Console.WriteLine("\nEnter data type number or name to subscribe to:");
+		string input = Console.ReadLine()?.Trim() ?? "";
+
+		string? selectedDataType = null;
+
+		// Check if input is a number (index)
+		if (int.TryParse(input, out int index) && index >= 1 && index <= validDataTypes.Count)
+		{
+			selectedDataType = validDataTypes[index - 1];
+		}
+		// Otherwise check if input matches a valid type name
+		else
+		{
+			selectedDataType = validDataTypes.FirstOrDefault(dt =>
+				dt.Equals(input, StringComparison.OrdinalIgnoreCase));
+		}
+
+		if (selectedDataType == null)
+		{
+			Console.WriteLine("Invalid data type. Please select from the available options.");
+			return;
+		}
+
+		// Check if already subscribed
+		if (PubSubConfig.SubscribedDataTypes.Contains(selectedDataType))
+		{
+			Console.WriteLine($"Already subscribed to {selectedDataType} data.");
+			return;
+		}
+
+		// Proceed with subscription
+		if (PubSubConfig.Subscribe(selectedDataType))
+		{
+			Console.WriteLine($"Successfully subscribed to {selectedDataType} data.");
+		}
+	}
+
+	/// <summary>
+	/// UI for removing an existing subscription
+	/// </summary>
+	private static void RemoveSubscription(Dictionary<int, string> dataTypes)
+	{
+		Console.WriteLine("\nEnter number of subscription to remove:");
+
+		if (int.TryParse(Console.ReadLine() ?? "", out int choice) && dataTypes.TryGetValue(choice, out string dataType))
+		{
+			if (PubSubConfig.Unsubscribe(dataType))
 			{
-				Console.WriteLine("No clients connected.");
-			}
-			else
-			{
-				foreach (var kvp in connectedWavys)
-				{
-					TimeSpan connectedFor = DateTime.Now - kvp.Value;
-					Console.WriteLine($"Wavy ID: {kvp.Key}");
-					Console.WriteLine($"  Connected since: {kvp.Value:HH:mm:ss}");
-					Console.WriteLine($"  Connected for: {connectedFor.Hours}h {connectedFor.Minutes}m {connectedFor.Seconds}s");
-				}
+				Console.WriteLine($"Successfully unsubscribed from {dataType} data.");
 			}
 		}
-		Console.WriteLine("============================\n");
+		else
+		{
+			Console.WriteLine("Invalid selection.");
+		}
 	}
 
 	/// <summary>
@@ -551,506 +648,13 @@ class Aggregator
 	{
 		Console.Clear();
 		Console.WriteLine($"Aggregator {aggregatorId} running...");
-		Console.WriteLine($"Listening on port {Config.ListeningPort}, sending to {Config.ServerIp}:{Config.ServerPort}");
+		Console.WriteLine($"Receiving data via ZeroMQ, sending to {Config.ServerIp}:{Config.ServerPort}");
 		DisplayCommandMenu();
 	}
 
 	#endregion
 
-	#region Network Listener and Client Handling
-
-	/// <summary>
-	/// Listens for incoming connections from Wavy clients
-	/// </summary>
-	private static void StartListener()
-	{
-		try
-		{
-			TcpListener listener = new TcpListener(IPAddress.Any, Config.ListeningPort);
-			listener.Start();
-			Console.WriteLine($"Aggregator listening on port {Config.ListeningPort}...");
-
-			while (isRunning)
-			{
-				try
-				{
-					if (listener.Pending())
-					{
-						AcceptClient(listener);
-					}
-					else
-					{
-						Thread.Sleep(Config.ClientPollIntervalMs);
-					}
-				}
-				catch (Exception ex)
-				{
-					Console.WriteLine($"Error accepting client: {ex.Message}");
-					Thread.Sleep(1000); // Delay before retry
-				}
-			}
-
-			listener.Stop();
-			Console.WriteLine("Listener stopped.");
-		}
-		catch (Exception ex)
-		{
-			Console.WriteLine($"Fatal error in listener: {ex.Message}");
-		}
-		finally
-		{
-			UnregisterThread(Thread.CurrentThread);
-		}
-	}
-
-	/// <summary>
-	/// Accepts a new client connection and creates a thread to handle it
-	/// </summary>
-	/// <param name="listener">The TCP listener to accept clients from</param>
-	private static void AcceptClient(TcpListener listener)
-	{
-		TcpClient client = listener.AcceptTcpClient();
-		Thread clientThread = new Thread(() => HandleClient(client))
-		{
-			IsBackground = true,
-			Name = $"Client-{DateTime.Now.Ticks}"
-		};
-
-		RegisterThread(clientThread);
-		clientThread.Start();
-	}
-
-	/// <summary>
-	/// Handles communication with a connected Wavy client
-	/// </summary>
-	/// <param name="client">The TCP client to handle</param>
-	private static async void HandleClient(TcpClient client)
-	{
-		string clientIp = "Unknown";
-
-		try
-		{
-			clientIp = ((IPEndPoint)client.Client.RemoteEndPoint).Address.ToString();
-			Console.WriteLine($"New connection from {clientIp}");
-
-			using (client)
-			using (NetworkStream stream = client.GetStream())
-			{
-				bool isHttpLikeRequest = false;
-
-				while (client.Connected && isRunning)
-				{
-					if (!stream.DataAvailable)
-					{
-						// Exit after processing HTTP-like request
-						if (isHttpLikeRequest)
-							break;
-
-						Thread.Sleep(Config.ClientPollIntervalMs);
-						continue;
-					}
-
-					byte[] buffer = new byte[Config.ReceiveBufferSize];
-					int bytesRead = stream.Read(buffer, 0, buffer.Length);
-
-					if (bytesRead <= 0)
-						break;
-
-					int messageCode = BitConverter.ToInt32(buffer, 0);
-					Console.WriteLine($"\n[{DateTime.Now:HH:mm:ss.fff}] Received message with code: {messageCode}");
-
-					// Identify HTTP-like requests
-					if (messageCode == MessageCodes.WavyDataHttpInitial)
-						isHttpLikeRequest = true;
-
-					// Process message based on code and await the result
-					await ProcessMessageAsync(buffer, bytesRead, stream, messageCode);
-
-					// Handle disconnection
-					if (messageCode == MessageCodes.WavyDisconnect)
-						return;
-
-					// Send confirmation for all messages (after processing is complete)
-					SendConfirmation(stream, MessageCodes.WavyConfirmation);
-
-					// For HTTP-like requests, after sending confirmation, we break from the loop
-					if (isHttpLikeRequest)
-						break;
-				}
-			}
-		}
-		catch (Exception ex)
-		{
-			Console.WriteLine($"Error handling client {clientIp}: {ex.Message}");
-		}
-		finally
-		{
-			Console.WriteLine($"Connection closed from {clientIp}");
-			UnregisterThread(Thread.CurrentThread);
-		}
-	}
-
-	/// <summary>
-	/// Processes a message based on its code asynchronously
-	/// </summary>
-	/// <param name="buffer">The received data buffer</param>
-	/// <param name="bytesRead">Number of bytes read from the buffer</param>
-	/// <param name="stream">The network stream for response</param>
-	/// <param name="messageCode">The message code identifying the type of message</param>
-	private static async Task ProcessMessageAsync(byte[] buffer, int bytesRead, NetworkStream stream, int messageCode)
-	{
-		switch (messageCode)
-		{
-			case MessageCodes.WavyConnect:
-				ProcessConnection(buffer, bytesRead, stream);
-				break;
-			case MessageCodes.WavyDataHttpInitial:
-			case MessageCodes.WavyDataInitial:
-			case MessageCodes.WavyDataResend:
-				await ProcessDataAsync(buffer, bytesRead, stream, messageCode);
-				break;
-			case MessageCodes.AggregatorData:
-				ProcessAggregatedData(buffer, bytesRead, stream);
-				break;
-			case MessageCodes.WavyDisconnect:
-				ProcessDisconnection(buffer, bytesRead, stream);
-				break;
-			default:
-				LogUnknownMessage(buffer, bytesRead, messageCode);
-				break;
-		}
-	}
-
-	/// <summary>
-	/// Processes data sent from a Wavy client with validation
-	/// </summary>
-	private static async Task ProcessDataAsync(byte[] buffer, int bytesRead, NetworkStream stream, int messageCode)
-	{
-		string jsonData = Encoding.UTF8.GetString(buffer, 4, bytesRead - 4);
-		string wavyId = "Unknown";
-
-		try
-		{
-			using (JsonDocument doc = JsonDocument.Parse(jsonData))
-			{
-				JsonElement root = doc.RootElement;
-
-				// Extract Wavy ID
-				if (root.TryGetProperty("WavyId", out JsonElement wavyIdElement))
-				{
-					wavyId = wavyIdElement.GetString();
-				}
-
-				Console.WriteLine($"[{messageCode}] Data received from Wavy ID: {wavyId}");
-
-				// Validate and clean data using remote service
-				var (isValid, cleanedData) = await Config._validationClient.ValidateAndCleanDataAsync(wavyId, jsonData);
-
-				if (!isValid)
-				{
-					Console.WriteLine($"[WARNING] Validation failed for data from Wavy ID: {wavyId}");
-					return;
-				}
-
-				// Use the cleaned data instead of the original
-				jsonData = cleanedData;
-			}
-
-			// Store the cleaned data in the data store
-			StoreInDataStore(jsonData);
-		}
-		catch (Exception ex)
-		{
-			Console.WriteLine($"Error processing data: {ex.Message}");
-			if (verboseMode)
-			{
-				Console.WriteLine($"Raw data: {jsonData}");
-			}
-		}
-	}
-
-	/// <summary>
-	/// Logs information about unknown message types
-	/// </summary>
-	/// <param name="buffer">The message buffer</param>
-	/// <param name="bytesRead">The number of bytes read</param>
-	/// <param name="messageCode">The unknown message code</param>
-	private static void LogUnknownMessage(byte[] buffer, int bytesRead, int messageCode)
-	{
-		if (verboseMode)
-		{
-			Console.WriteLine($"Unknown message code: {messageCode}");
-			string receivedData = Encoding.UTF8.GetString(buffer, 4, bytesRead - 4);
-			Console.WriteLine($"Payload: {receivedData}");
-		}
-	}
-
-	#endregion
-
-	#region Message Processing
-
-	/// <summary>
-	/// Processes a connection request from a Wavy client and registers it
-	/// </summary>
-	/// <param name="buffer">The received data buffer</param>
-	/// <param name="bytesRead">Number of bytes read from the buffer</param>
-	/// <param name="stream">The network stream for response</param>
-	private static void ProcessConnection(byte[] buffer, int bytesRead, NetworkStream stream)
-	{
-		string wavyId = Encoding.UTF8.GetString(buffer, 4, bytesRead - 4);
-		lock (connectedWavys)
-		{
-			connectedWavys[wavyId] = DateTime.Now;
-		}
-		Console.WriteLine($"Wavy connection request from ID: {wavyId}");
-	}
-
-	/// <summary>
-	/// Processes a disconnection request from a Wavy client and removes it from registry
-	/// </summary>
-	/// <param name="buffer">The received data buffer</param>
-	/// <param name="bytesRead">Number of bytes read from the buffer</param>
-	/// <param name="stream">The network stream for response</param>
-	private static void ProcessDisconnection(byte[] buffer, int bytesRead, NetworkStream stream)
-	{
-		string wavyId = Encoding.UTF8.GetString(buffer, 4, bytesRead - 4);
-		lock (connectedWavys)
-		{
-			if (connectedWavys.ContainsKey(wavyId))
-			{
-				connectedWavys.Remove(wavyId);
-			}
-		}
-		Console.WriteLine($"Wavy disconnection request from ID: {wavyId}");
-	}
-
-	// Helper method to store data in the data store
-	private static void StoreInDataStore(string jsonData)
-	{
-		try
-		{
-			using (JsonDocument doc = JsonDocument.Parse(jsonData))
-			{
-				JsonElement root = doc.RootElement;
-
-				// Validate required fields
-				if (!ValidateWavyDataFormat(root))
-				{
-					LogInvalidDataFormat(jsonData);
-					return;
-				}
-
-				string wavyId = root.GetProperty("WavyId").GetString();
-
-				// Store each data item
-				foreach (JsonElement item in root.GetProperty("Data").EnumerateArray())
-				{
-					ProcessAndStoreDataItem(item, wavyId);
-				}
-			}
-		}
-		catch (Exception ex)
-		{
-			Console.WriteLine($"Error storing cleaned data: {ex.Message}");
-		}
-	}
-
-	/// <summary>
-	/// Validates that the Wavy data has the required format
-	/// </summary>
-	/// <param name="root">The root JSON element to validate</param>
-	/// <returns>True if the data has valid format, false otherwise</returns>
-	private static bool ValidateWavyDataFormat(JsonElement root)
-	{
-		return root.TryGetProperty("WavyId", out JsonElement _) &&
-			   root.TryGetProperty("Data", out JsonElement dataArray) &&
-			   dataArray.ValueKind == JsonValueKind.Array;
-	}
-
-	/// <summary>
-	/// Logs information about invalid data format received
-	/// </summary>
-	/// <param name="jsonData">The raw JSON data that was invalid</param>
-	private static void LogInvalidDataFormat(string jsonData)
-	{
-		Console.WriteLine("Received malformed data packet - missing required properties");
-		if (verboseMode)
-		{
-			Console.WriteLine($"Raw data: {jsonData}");
-		}
-	}
-
-	/// <summary>
-	/// Processes aggregated data sent in HTTP-like mode
-	/// </summary>
-	/// <param name="buffer">The received data buffer</param>
-	/// <param name="bytesRead">Number of bytes read from the buffer</param>
-	/// <param name="stream">The network stream for response</param>
-	private static void ProcessAggregatedData(byte[] buffer, int bytesRead, NetworkStream stream)
-	{
-		string jsonData = Encoding.UTF8.GetString(buffer, 4, bytesRead - 4);
-
-		try
-		{
-			using (JsonDocument doc = JsonDocument.Parse(jsonData))
-			{
-				JsonElement root = doc.RootElement;
-
-				// Extract WavyId if present
-				string wavyId = ExtractWavyId(root);
-
-				// Process data array if present
-				if (root.TryGetProperty("Data", out JsonElement dataArray) && dataArray.ValueKind == JsonValueKind.Array)
-				{
-					if (verboseMode)
-					{
-						Console.WriteLine("Aggregated Data:");
-					}
-
-					foreach (JsonElement item in dataArray.EnumerateArray())
-					{
-						ProcessAndStoreDataItem(item, wavyId);
-					}
-				}
-			}
-		}
-		catch (Exception ex)
-		{
-			Console.WriteLine($"Error parsing aggregated JSON data: {ex.Message}");
-			if (verboseMode)
-			{
-				Console.WriteLine($"Raw data: {jsonData}");
-			}
-		}
-	}
-
-	/// <summary>
-	/// Extracts the Wavy ID from the root JSON element if present
-	/// </summary>
-	/// <param name="root">The root JSON element to extract from</param>
-	/// <returns>The Wavy ID string or null if not found</returns>
-	private static string ExtractWavyId(JsonElement root)
-	{
-		if (root.TryGetProperty("WavyId", out JsonElement wavyIdElement))
-		{
-			string wavyId = wavyIdElement.GetString();
-			Console.WriteLine($"[{MessageCodes.AggregatorData}] Aggregated data received from Wavy ID: {wavyId}");
-			return wavyId;
-		}
-
-		Console.WriteLine($"[{MessageCodes.AggregatorData}] Aggregated data received (no Wavy ID found)");
-		return null;
-	}
-
-	/// <summary>
-	/// Processes and stores a single data item
-	/// </summary>
-	/// <param name="item">The JSON element containing the data item</param>
-	/// <param name="wavyId">The Wavy ID associated with this data (can be null)</param>
-	private static void ProcessAndStoreDataItem(JsonElement item, string wavyId = null)
-	{
-		try
-		{
-			// Ensure required DataType property exists
-			if (!item.TryGetProperty("DataType", out JsonElement dataTypeElement))
-				return;
-
-			string dataType = dataTypeElement.GetString();
-
-			// Ensure container exists for this data type
-			EnsureDataStoreContainer(dataType);
-
-			// Store the data item with Wavy ID
-			StoreDataItem(item, dataType, wavyId);
-
-			// Log in verbose mode
-			LogDataItemDetails(item, dataType, wavyId);
-		}
-		catch (Exception ex)
-		{
-			Console.WriteLine($"Error processing data item: {ex.Message}");
-		}
-	}
-
-	/// <summary>
-	/// Ensures a container exists in the data store for a particular data type
-	/// </summary>
-	/// <param name="dataType">The data type to create a container for</param>
-	private static void EnsureDataStoreContainer(string dataType)
-	{
-		if (!dataStore.ContainsKey(dataType))
-		{
-			dataStore[dataType] = new ConcurrentBag<string>();
-		}
-	}
-
-	/// <summary>
-	/// Stores a data item in the data store
-	/// </summary>
-	/// <param name="item">The JSON element containing the data item</param>
-	/// <param name="dataType">The type of data being stored</param>
-	/// <param name="wavyId">The Wavy ID to associate with the data (can be null)</param>
-	private static void StoreDataItem(JsonElement item, string dataType, string wavyId)
-	{
-		if (wavyId != null)
-		{
-			// Add WavyId to the data item
-			var dataWithWavyId = CreateDataItemWithWavyId(item, wavyId);
-			string jsonData = JsonSerializer.Serialize(dataWithWavyId);
-			dataStore[dataType].Add(jsonData);
-		}
-		else
-		{
-			// Store as-is
-			dataStore[dataType].Add(item.GetRawText());
-		}
-	}
-
-	/// <summary>
-	/// Creates a dictionary with a Wavy ID added to an existing JSON element
-	/// </summary>
-	/// <param name="item">The source JSON element</param>
-	/// <param name="wavyId">The Wavy ID to add</param>
-	/// <returns>A dictionary with all properties from the JSON element plus the Wavy ID</returns>
-	private static Dictionary<string, object> CreateDataItemWithWavyId(JsonElement item, string wavyId)
-	{
-		var dataWithWavyId = new Dictionary<string, object>();
-
-		// Copy all existing properties
-		foreach (JsonProperty prop in item.EnumerateObject())
-		{
-			if (prop.Name == "DataType")
-				dataWithWavyId["DataType"] = prop.Value.GetString();
-			else if (prop.Name == "Value")
-				dataWithWavyId["Value"] = prop.Value.GetDouble();
-			else
-				dataWithWavyId[prop.Name] = JsonSerializer.Deserialize<object>(prop.Value.GetRawText());
-		}
-
-		// Add the WavyId
-		dataWithWavyId["WavyId"] = wavyId;
-
-		return dataWithWavyId;
-	}
-
-	/// <summary>
-	/// Logs details about a data item in verbose mode
-	/// </summary>
-	/// <param name="item">The JSON element containing the data item</param>
-	/// <param name="dataType">The type of data</param>
-	/// <param name="wavyId">The Wavy ID associated with this data (can be null)</param>
-	private static void LogDataItemDetails(JsonElement item, string dataType, string wavyId)
-	{
-		if (verboseMode && item.TryGetProperty("Value", out JsonElement valueElement))
-		{
-			double value = valueElement.GetDouble();
-			Console.WriteLine($"  - {dataType}: {value}{(wavyId != null ? $" (Wavy: {wavyId})" : "")}");
-		}
-	}
-
-	#endregion
-
-	#region Data Transmission to Server
+	#region Data Processing and Server Communication
 
 	/// <summary>
 	/// Periodically sends aggregated data to the server based on configured interval
@@ -1141,11 +745,83 @@ class Aggregator
 
 		foreach (var dataType in dataToSend.Keys)
 		{
-			var parsedItems = ParseDataItems(dataToSend[dataType]);
-
-			if (parsedItems.Count > 0)
+			try
 			{
-				aggregatedDataList.Add(new { DataType = dataType, Data = parsedItems });
+				var dataItems = new List<object>();
+
+				// Parse each JSON string into an object
+				foreach (var jsonItem in dataToSend[dataType])
+				{
+					try
+					{
+						// Debug the JSON to see what's coming in
+						if (verboseMode)
+						{
+							Console.WriteLine($"Processing item for {dataType}: {jsonItem}");
+						}
+
+						// Parse the JSON and create a simplified object with just the essential properties
+						using (JsonDocument doc = JsonDocument.Parse(jsonItem))
+						{
+							var root = doc.RootElement;
+
+							// Extract the key properties
+							double value = 0;
+							string wavyId = "Unknown";
+
+							if (root.TryGetProperty("Value", out var valueElement))
+							{
+								// Explicitly handle different value kinds
+								if (valueElement.ValueKind == JsonValueKind.Number)
+								{
+									value = valueElement.GetDouble();
+								}
+								else if (valueElement.ValueKind == JsonValueKind.String)
+								{
+									string valueStr = valueElement.GetString() ?? "0";
+									double.TryParse(valueStr, out value);
+								}
+								Console.WriteLine($"Found value: {value}"); // Debug output
+							}
+
+							if (root.TryGetProperty("WavyId", out var wavyIdElement))
+							{
+								wavyId = wavyIdElement.GetString() ?? "Unknown";
+							}
+
+							// Create a simple, clean data item with just the essential fields
+							// Use a concrete Dictionary instead of anonymous object to ensure correct serialization
+							dataItems.Add(new Dictionary<string, object>
+							{
+								["Value"] = value, // Make sure "Value" is capitalized to match what the server expects
+								["WavyId"] = wavyId // Make sure "WavyId" is capitalized to match what the server expects
+							});
+						}
+					}
+					catch (Exception ex)
+					{
+						Console.WriteLine($"Failed to parse data item: {ex.Message}");
+						if (verboseMode)
+						{
+							Console.WriteLine($"Problem item: {jsonItem}");
+						}
+					}
+				}
+
+				if (dataItems.Count > 0)
+				{
+					// Create a properly formatted data object for this data type
+					// Use a concrete Dictionary instead of anonymous object
+					aggregatedDataList.Add(new Dictionary<string, object>
+					{
+						["DataType"] = dataType,
+						["Data"] = dataItems.ToArray()  // Use an array for stable serialization
+					});
+				}
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"Error aggregating {dataType} data: {ex.Message}");
 			}
 		}
 
@@ -1187,12 +863,15 @@ class Aggregator
 	/// <returns>An object representing the complete message payload</returns>
 	private static object CreateMessagePayload(List<object> aggregatedDataList)
 	{
-		return new
+		// Serialize using simpler types to avoid any serialization issues
+		var payload = new Dictionary<string, object>
 		{
-			AggregatorId = aggregatorId,
-			Timestamp = DateTime.UtcNow,
-			Data = aggregatedDataList
+			{ "AggregatorId", aggregatorId },
+			{ "Timestamp", DateTime.UtcNow.ToString("o") },  // ISO 8601 string format
+			{ "Data", aggregatedDataList }
 		};
+
+		return payload;
 	}
 
 	/// <summary>
@@ -1203,6 +882,18 @@ class Aggregator
 	{
 		bool confirmed = false;
 		int retryCount = 0;
+
+		// Do a quick check to make sure the JSON is valid before sending
+		try
+		{
+			using (JsonDocument.Parse(jsonData)) { }
+			Console.WriteLine("JSON validation passed");
+		}
+		catch (JsonException ex)
+		{
+			Console.WriteLine($"ERROR: Invalid JSON data, not sending: {ex.Message}");
+			return;
+		}
 
 		try
 		{
@@ -1224,10 +915,16 @@ class Aggregator
 
 						// Send data to server
 						SendMessage(stream, jsonData, messageCode);
-						Console.WriteLine($"[{messageCode}] Data sent to server:");
+						Console.WriteLine($"[{messageCode}] Data sent to server, size: {jsonData.Length} bytes");
+
 						if (verboseMode)
 						{
-							Console.WriteLine(jsonData);
+							// Show only a sample in verbose mode to avoid flooding
+							const int maxDisplayLength = 500;
+							string displayJson = jsonData.Length > maxDisplayLength
+								? jsonData.Substring(0, maxDisplayLength) + "..."
+								: jsonData;
+							Console.WriteLine(displayJson);
 						}
 
 						// Wait for confirmation
@@ -1298,6 +995,497 @@ class Aggregator
 
 	#endregion
 
+	#region Pub-Sub Communication
+
+	/// <summary>
+	/// Manages publish-subscribe communication settings and operations
+	/// </summary>
+	private static class PubSubConfig
+	{
+		// The Wavy publisher address to connect to
+		public static string PublisherAddress { get; set; } = "tcp://127.0.0.1:5556";
+
+		// The Wavy subscription management address
+		public static string SubscriptionManagerAddress { get; set; } = "tcp://127.0.0.1:5557";
+
+		// Data types this aggregator is interested in
+		public static HashSet<string> SubscribedDataTypes { get; private set; } = new HashSet<string>();
+
+		// Configuration file path
+		public static readonly string SubscriptionFilePath = "aggregator_subscriptions.json";
+
+		// Active subscribers for each data type
+		private static Dictionary<string, SubscriberSocket> _subscribers = new Dictionary<string, SubscriberSocket>();
+
+		/// <summary>
+		/// Loads subscriptions from configuration file
+		/// </summary>
+		public static void LoadSubscriptions()
+		{
+			try
+			{
+				if (File.Exists(SubscriptionFilePath))
+				{
+					string json = File.ReadAllText(SubscriptionFilePath);
+					var subscriptions = JsonSerializer.Deserialize<List<string>>(json);
+
+					if (subscriptions != null)
+					{
+						SubscribedDataTypes.Clear();
+						foreach (var dataType in subscriptions)
+						{
+							SubscribedDataTypes.Add(dataType);
+						}
+						Console.WriteLine($"Loaded {SubscribedDataTypes.Count} subscribed data types");
+
+						if (Config.VerboseMode)
+						{
+							Console.WriteLine("Subscribed data types: " + string.Join(", ", SubscribedDataTypes));
+						}
+					}
+				}
+				else
+				{
+					// Use default subscriptions from Config class
+					SubscribedDataTypes.Clear();
+					foreach (var dataType in Config.DefaultSubscribedDataTypes)
+					{
+						SubscribedDataTypes.Add(dataType);
+					}
+					SaveSubscriptions();
+					Console.WriteLine($"Created default subscriptions file with {SubscribedDataTypes.Count} data types");
+				}
+
+				// Subscribe to each data type
+				foreach (var dataType in SubscribedDataTypes)
+				{
+					Subscribe(dataType);
+				}
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"Error loading subscriptions: {ex.Message}");
+
+				// In case of error, fall back to Config defaults
+				SubscribedDataTypes.Clear();
+				foreach (var dataType in Config.DefaultSubscribedDataTypes)
+				{
+					SubscribedDataTypes.Add(dataType);
+				}
+				Console.WriteLine("Using default subscriptions from configuration");
+			}
+		}
+
+		/// <summary>
+		/// Subscribes to a specific data type
+		/// </summary>
+		public static bool Subscribe(string dataType)
+		{
+			try
+			{
+				// Create or verify local subscription
+				bool alreadySubscribed = SubscribedDataTypes.Contains(dataType);
+
+				// Add to local subscriptions list if not already there
+				if (!alreadySubscribed)
+				{
+					SubscribedDataTypes.Add(dataType);
+				}
+
+				// Create subscriber socket if needed
+				if (!_subscribers.TryGetValue(dataType, out var socket))
+				{
+					socket = new SubscriberSocket();
+					Console.WriteLine($"Connecting subscriber to {PublisherAddress}");
+					socket.Connect(PublisherAddress);
+					Console.WriteLine($"Subscribing to topic '{dataType}'");
+					socket.Subscribe(dataType);
+
+					_subscribers[dataType] = socket;
+
+					// Start a listener thread for this subscription
+					StartSubscriptionListener(dataType, socket);
+				}
+
+				// ALWAYS notify the Wavy about this subscription with retries, even if already subscribed locally
+				Console.WriteLine($"{(alreadySubscribed ? "Re-sending" : "Sending")} subscription request for {dataType} to Wavy");
+
+				int maxRetries = 3;
+				bool requestSent = false;
+
+				for (int attempt = 0; attempt < maxRetries && !requestSent; attempt++)
+				{
+					try
+					{
+						Console.WriteLine($"Attempt {attempt + 1}/{maxRetries}: Connecting to {SubscriptionManagerAddress} for {dataType} subscription");
+
+						using (var requestSocket = new RequestSocket())
+						{
+							// Set socket options for better reliability
+							requestSocket.Options.Linger = TimeSpan.FromMilliseconds(500);
+
+							requestSocket.Connect(SubscriptionManagerAddress);
+							Console.WriteLine($"Connected to subscription manager");
+
+							// Prepare the subscription request
+							var request = new Dictionary<string, object>
+							{
+								{ "action", "subscribe" },
+								{ "dataType", dataType }
+							};
+							string json = JsonSerializer.Serialize(request);
+
+							Console.WriteLine($"Sending subscription request: {json}");
+							requestSocket.SendFrame(json);
+
+							Console.WriteLine($"Waiting for response...");
+
+							try
+							{
+								// Just use the standard ReceiveFrameString without timeout
+								// The socket will use its default timeout behavior
+								string response = requestSocket.ReceiveFrameString();
+								Console.WriteLine($"Subscription response: {response}");
+								requestSent = true;
+							}
+							catch (NetMQException ex)
+							{
+								// Only log and continue, don't rethrow
+								Console.WriteLine($"Failed to receive response: {ex.Message}");
+							}
+						}
+
+						// Wait before retry if needed
+						if (!requestSent && attempt < maxRetries - 1)
+						{
+							Console.WriteLine($"Waiting 1 second before retry...");
+							Thread.Sleep(1000);
+						}
+					}
+					catch (Exception ex)
+					{
+						Console.WriteLine($"Attempt {attempt + 1} failed: {ex.Message}");
+
+						if (attempt < maxRetries - 1)
+						{
+							Console.WriteLine($"Waiting 1 second before retry...");
+							Thread.Sleep(1000);
+						}
+					}
+				}
+
+				// Save subscriptions
+				SaveSubscriptions();
+
+				if (requestSent)
+					Console.WriteLine($"Successfully {(alreadySubscribed ? "refreshed" : "subscribed to")} {dataType} data");
+				else
+					Console.WriteLine($"Warning: Could not notify Wavy about {dataType} subscription, but will listen for messages anyway");
+
+				return true;
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"Error subscribing to {dataType}: {ex.Message}");
+				Console.WriteLine($"Stack trace: {ex.StackTrace}");
+				return false;
+			}
+		}
+
+		/// <summary>
+		/// Unsubscribes from a specific data type
+		/// </summary>
+		public static bool Unsubscribe(string dataType)
+		{
+			try
+			{
+				// Remove from subscriptions list
+				if (!SubscribedDataTypes.Remove(dataType))
+				{
+					// Not subscribed
+					return true;
+				}
+
+				// Remove subscriber socket if it exists
+				if (_subscribers.TryGetValue(dataType, out var socket))
+				{
+					socket.Dispose();
+					_subscribers.Remove(dataType);
+				}
+
+				// Notify the Wavy about unsubscribing
+				using (var requestSocket = new RequestSocket())
+				{
+					requestSocket.Connect(SubscriptionManagerAddress);
+
+					var request = new Dictionary<string, object>
+					{
+						{ "action", "unsubscribe" },
+						{ "dataType", dataType }
+					};
+
+					string json = JsonSerializer.Serialize(request);
+					requestSocket.SendFrame(json);
+
+					string response = requestSocket.ReceiveFrameString();
+					Console.WriteLine($"Unsubscription request response: {response}");
+				}
+
+				SaveSubscriptions();
+				Console.WriteLine($"Unsubscribed from {dataType} data");
+				return true;
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"Error unsubscribing from {dataType}: {ex.Message}");
+				return false;
+			}
+		}
+
+		/// <summary>
+		/// Starts a listener thread for a specific data type subscription
+		/// </summary>
+		private static void StartSubscriptionListener(string dataType, SubscriberSocket socket)
+		{
+			Thread listenerThread = new Thread(() =>
+			{
+				try
+				{
+					Console.WriteLine($"Started listener for {dataType} data");
+
+					while (isRunning)
+					{
+						try
+						{
+							string topic = socket.ReceiveFrameString();
+							string messageJson = socket.ReceiveFrameString();
+
+							if (verboseMode)
+							{
+								Console.WriteLine($"Received {topic} data: {messageJson}");
+							}
+
+							// Process the received data
+							var data = JsonSerializer.Deserialize<Dictionary<string, object>>(messageJson);
+							if (data != null)
+							{
+								// Store the data
+								ProcessReceivedData(dataType, data);
+							}
+						}
+						catch (Exception ex)
+						{
+							if (isRunning) // Only log if not shutting down
+							{
+								Console.WriteLine($"Error receiving {dataType} data: {ex.Message}");
+							}
+							Thread.Sleep(1000); // Avoid tight loop on error
+						}
+					}
+				}
+				catch (Exception ex)
+				{
+					Console.WriteLine($"Fatal error in {dataType} listener: {ex.Message}");
+				}
+				finally
+				{
+					UnregisterThread(Thread.CurrentThread);
+				}
+			})
+			{
+				IsBackground = true,
+				Name = $"Subscriber-{dataType}"
+			};
+
+			RegisterThread(listenerThread);
+			listenerThread.Start();
+		}
+
+		/// <summary>
+		/// Saves current subscriptions to configuration file
+		/// </summary>
+		public static void SaveSubscriptions()
+		{
+			try
+			{
+				string json = JsonSerializer.Serialize(SubscribedDataTypes.ToList(),
+					new JsonSerializerOptions { WriteIndented = true });
+
+				File.WriteAllText(SubscriptionFilePath, json);
+				Console.WriteLine("Subscription settings saved to file");
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"Error saving subscriptions: {ex.Message}");
+			}
+		}
+
+		/// <summary>
+		/// Processes data received from a subscription
+		/// </summary>
+		private static async void ProcessReceivedData(string dataType, Dictionary<string, object> data)
+		{
+			try
+			{
+				// Extract Wavy ID if present or use "Unknown"
+				string wavyId = "Unknown";
+				if (data.TryGetValue("WavyId", out var wavyIdObj) && wavyIdObj != null)
+				{
+					wavyId = wavyIdObj.ToString() ?? "Unknown";
+				}
+
+				// Extract the value - handle JsonElement properly
+				double value = 0.0;
+				if (data.TryGetValue("Value", out var valueObj) && valueObj != null)
+				{
+					// Handle JsonElement conversion properly
+					if (valueObj is JsonElement jsonElement)
+					{
+						if (jsonElement.ValueKind == JsonValueKind.Number)
+						{
+							value = jsonElement.GetDouble();
+						}
+						else if (jsonElement.ValueKind == JsonValueKind.String &&
+								 !string.IsNullOrEmpty(jsonElement.GetString()) &&
+								 double.TryParse(jsonElement.GetString(), out double parsedValue))
+						{
+							value = parsedValue;
+						}
+					}
+					else
+					{
+						// Try regular conversion for other types
+						try
+						{
+							value = Convert.ToDouble(valueObj);
+						}
+						catch (Exception convEx)
+						{
+							Console.WriteLine($"Value conversion error: {convEx.Message}. Using default value 0.");
+						}
+					}
+				}
+
+				// Debug output
+				Console.WriteLine($"Extracted value for {dataType}: {value} (from {wavyId})");
+
+				// Create validation data format expected by the gRPC validation service
+				var validationData = new
+				{
+					Data = new[]
+					{
+				new
+				{
+					DataType = dataType,
+					Value = value
+				}
+			}
+				};
+
+				string validationJson = JsonSerializer.Serialize(validationData);
+				Console.WriteLine($"Validating data for {dataType}: {validationJson}");
+
+				// Send data for validation
+				try
+				{
+					var (isValid, cleanedData) = await Config._validationClient.ValidateAndCleanDataAsync(wavyId, validationJson);
+
+					if (!isValid)
+					{
+						Console.WriteLine($"[WARNING] Validation failed for {dataType} data from {wavyId}");
+						if (verboseMode)
+						{
+							Console.WriteLine($"  Invalid data: {validationJson}");
+						}
+						return; // Skip invalid data
+					}
+
+					Console.WriteLine($"Validation succeeded for {dataType} data from {wavyId}");
+
+					// Create data to store - ensure proper structure with capitalized field names
+					var storeDataItem = new Dictionary<string, object>
+			{
+				{ "DataType", dataType },
+				{ "Value", value },  // Use capitalized "Value" to match what Server expects
+                { "WavyId", wavyId },  // Use capitalized "WavyId" to match what Server expects
+                { "Timestamp", DateTime.UtcNow }
+			};
+
+					string json = JsonSerializer.Serialize(storeDataItem);
+
+					// Store the data
+					if (!dataStore.TryGetValue(dataType, out var container))
+					{
+						container = new ConcurrentBag<string>();
+						dataStore[dataType] = container;
+					}
+
+					container.Add(json);
+
+					Console.WriteLine($"Stored {dataType} data point via ZeroMQ pub-sub with value {value}");
+					if (verboseMode)
+					{
+						Console.WriteLine($"  Stored data: {json}");
+					}
+				}
+				catch (Exception valEx)
+				{
+					Console.WriteLine($"Data validation error: {valEx.Message}");
+
+					// Fall back to creating a simple data structure for storage without validation
+					var simpleDataItem = new Dictionary<string, object>
+			{
+				{ "DataType", dataType },
+				{ "Value", value },  // Use capitalized "Value"
+                { "WavyId", wavyId },  // Use capitalized "WavyId"
+                { "Timestamp", DateTime.UtcNow }
+			};
+
+					string json = JsonSerializer.Serialize(simpleDataItem);
+
+					// Get or create container for this data type
+					if (!dataStore.TryGetValue(dataType, out var container))
+					{
+						container = new ConcurrentBag<string>();
+						dataStore[dataType] = container;
+					}
+
+					// Store unvalidated data
+					container.Add(json);
+
+					Console.WriteLine($"Stored unvalidated {dataType} data point via ZeroMQ pub-sub with value {value}");
+					if (verboseMode)
+					{
+						Console.WriteLine($"  Stored data: {json}");
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"Error processing ZeroMQ data for {dataType}: {ex.Message}");
+				if (verboseMode)
+				{
+					Console.WriteLine($"Stack trace: {ex.StackTrace}");
+				}
+			}
+		}
+
+		/// <summary>
+		/// Cleans up ZeroMQ resources
+		/// </summary>
+		public static void Cleanup()
+		{
+			foreach (var socket in _subscribers.Values)
+			{
+				socket.Dispose();
+			}
+
+			_subscribers.Clear();
+		}
+	}
+
+	#endregion
+
 	#region Network Utilities
 
 	/// <summary>
@@ -1333,30 +1521,6 @@ class Aggregator
 		{
 			Console.WriteLine($"Error sending message: {ex.Message}");
 			throw; // Rethrow to let caller handle
-		}
-	}
-
-	/// <summary>
-	/// Sends a confirmation message with the specified code
-	/// </summary>
-	/// <param name="stream">The network stream to send the confirmation to</param>
-	/// <param name="code">The confirmation code to send</param>
-	private static void SendConfirmation(NetworkStream stream, int code)
-	{
-		try
-		{
-			// For control messages, only the code is sent
-			byte[] codeBytes = BitConverter.GetBytes(code);
-			stream.Write(codeBytes, 0, codeBytes.Length);
-
-			if (verboseMode)
-			{
-				Console.WriteLine($"Sent confirmation code: {code}");
-			}
-		}
-		catch (Exception ex)
-		{
-			Console.WriteLine($"Error sending confirmation: {ex.Message}");
 		}
 	}
 

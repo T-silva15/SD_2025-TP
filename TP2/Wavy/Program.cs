@@ -2,37 +2,17 @@
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
-using System.Net.Sockets;
-using System.Text;
 using System.Text.Json;
 using System.Threading;
+using NetMQ;
+using NetMQ.Sockets;
 
 /// <summary>
-/// Edge component of the OceanMonitor system that generates sensor data and transmits it to the Aggregator.
-/// Operates in either HTTP-like mode (connect-send-disconnect) or continuous connection mode.
+/// Edge component of the OceanMonitor system that generates sensor data and transmits it to the Aggregator
+/// using ZeroMQ publish-subscribe mechanism.
 /// </summary>
 public class Wavy
 {
-	#region Protocol Constants
-
-	/// <summary>
-	/// Message codes used in the communication protocol between system components
-	/// </summary>
-	private static class MessageCodes
-	{
-		// Wavy to Aggregator communication codes
-		public const int WavyConnect = 101;
-		public const int WavyDataHttpInitial = 200;
-		public const int WavyDataInitial = 201;
-		public const int WavyDataResend = 202;
-		public const int WavyDisconnect = 501;
-
-		// Response codes
-		public const int AggregatorConfirmation = 401;
-	}
-
-	#endregion
-
 	#region Configuration
 
 	/// <summary>
@@ -40,18 +20,9 @@ public class Wavy
 	/// </summary>
 	private static class Config
 	{
-		// Network configuration
-		public static string AggregatorIp { get; set; } = "127.0.0.1";
-		public static int AggregatorPort { get; set; } = 5000;
-
-		// Operation mode
-		public static bool UseHttpLikeMode { get; set; } = true;
-
-		// Communication parameters
-		public static int ConfirmationTimeoutMs { get; set; } = 5000;
-		public static int DataTransmissionIntervalMs { get; set; } = 7000;
-		public static int RetryIntervalMs { get; set; } = 2000;
-		public static int MaxRetryAttempts { get; set; } = 3;
+		// ZeroMQ configuration
+		public static string PublisherAddress { get; set; } = "tcp://127.0.0.1:5556";
+		public static string SubscriptionManagerAddress { get; set; } = "tcp://127.0.0.1:5557";
 
 		// Sensor simulation intervals
 		public static int TemperatureIntervalMs { get; private set; } = 6000;
@@ -105,13 +76,8 @@ public class Wavy
 		/// <param name="config">Dictionary containing configuration values</param>
 		private static void ApplyConfigValues(Dictionary<string, object> config)
 		{
-			ExtractStringValue(config, "AggregatorIp", value => AggregatorIp = value);
-			ExtractIntValue(config, "AggregatorPort", value => AggregatorPort = value);
-			ExtractBoolValue(config, "UseHttpLikeMode", value => UseHttpLikeMode = value);
-			ExtractIntValue(config, "ConfirmationTimeoutMs", value => ConfirmationTimeoutMs = value);
-			ExtractIntValue(config, "DataTransmissionIntervalMs", value => DataTransmissionIntervalMs = value);
-			ExtractIntValue(config, "RetryIntervalMs", value => RetryIntervalMs = value);
-			ExtractIntValue(config, "MaxRetryAttempts", value => MaxRetryAttempts = value);
+			ExtractStringValue(config, "PublisherAddress", value => PublisherAddress = value);
+			ExtractStringValue(config, "SubscriptionManagerAddress", value => SubscriptionManagerAddress = value);
 			ExtractIntValue(config, "TemperatureIntervalMs", value => TemperatureIntervalMs = value);
 			ExtractIntValue(config, "WindSpeedIntervalMs", value => WindSpeedIntervalMs = value);
 			ExtractIntValue(config, "FrequencyIntervalMs", value => FrequencyIntervalMs = value);
@@ -168,13 +134,8 @@ public class Wavy
 			{
 				var config = new Dictionary<string, object>
 				{
-					{ "AggregatorIp", AggregatorIp },
-					{ "AggregatorPort", AggregatorPort },
-					{ "UseHttpLikeMode", UseHttpLikeMode },
-					{ "ConfirmationTimeoutMs", ConfirmationTimeoutMs },
-					{ "DataTransmissionIntervalMs", DataTransmissionIntervalMs },
-					{ "RetryIntervalMs", RetryIntervalMs },
-					{ "MaxRetryAttempts", MaxRetryAttempts },
+					{ "PublisherAddress", PublisherAddress },
+					{ "SubscriptionManagerAddress", SubscriptionManagerAddress },
 					{ "TemperatureIntervalMs", TemperatureIntervalMs },
 					{ "WindSpeedIntervalMs", WindSpeedIntervalMs },
 					{ "FrequencyIntervalMs", FrequencyIntervalMs },
@@ -276,37 +237,25 @@ public class Wavy
 
 			switch (arg)
 			{
-				case "--http":
-				case "-h":
-					Config.UseHttpLikeMode = true;
-					break;
-				case "--continuous":
-				case "-c":
-					Config.UseHttpLikeMode = false;
-					break;
-				case "--interval":
-				case "-i":
-					if (i + 1 < args.Length && int.TryParse(args[i + 1], out int interval))
-					{
-						Config.DataTransmissionIntervalMs = interval;
-						i++; // Skip the value
-					}
-					break;
-				case "--ip":
-				case "-ip":
+				case "--pub":
+				case "-p":
 					if (i + 1 < args.Length)
 					{
-						Config.AggregatorIp = args[i + 1];
+						Config.PublisherAddress = args[i + 1];
 						i++; // Skip the value
 					}
 					break;
-				case "--port":
-				case "-p":
-					if (i + 1 < args.Length && int.TryParse(args[i + 1], out int port))
+				case "--sub":
+				case "-s":
+					if (i + 1 < args.Length)
 					{
-						Config.AggregatorPort = port;
+						Config.SubscriptionManagerAddress = args[i + 1];
 						i++; // Skip the value
 					}
+					break;
+				case "--verbose":
+				case "-v":
+					Config.VerboseMode = true;
 					break;
 			}
 		}
@@ -318,8 +267,8 @@ public class Wavy
 	private static void DisplayStartupInfo()
 	{
 		Console.WriteLine($"Wavy client starting (ID: {wavyId})");
-		Console.WriteLine($"Mode: {(Config.UseHttpLikeMode ? "HTTP-like" : "Continuous connection")}");
-		Console.WriteLine($"Connecting to Aggregator at {Config.AggregatorIp}:{Config.AggregatorPort}");
+		Console.WriteLine($"Publishing on {Config.PublisherAddress}");
+		Console.WriteLine($"Subscription manager on {Config.SubscriptionManagerAddress}");
 		DisplayCommandMenu();
 	}
 
@@ -329,7 +278,6 @@ public class Wavy
 	private static void DisplayCommandMenu()
 	{
 		Console.WriteLine("\nAvailable Commands:");
-		Console.WriteLine("Press 'M' to toggle connection mode");
 		Console.WriteLine("Press 'V' to toggle verbose mode");
 		Console.WriteLine("Press 'T' to show active threads");
 		Console.WriteLine("Press 'S' to save current configuration");
@@ -342,17 +290,18 @@ public class Wavy
 	/// </summary>
 	private static void InitializeThreads()
 	{
-		// Create a data queue shared by all sensor threads
-		var dataQueue = new ConcurrentQueue<Dictionary<string, object>>();
+		// Initialize ZeroMQ publisher and load subscriptions
+		PubSubConfig.InitializePublisher();  // Initialize the publisher socket once
+		PubSubConfig.LoadSubscriptions();
+
+		// Start subscription listener
+		StartSubscriptionListener();
 
 		// Start keyboard monitor thread
 		StartKeyboardMonitor();
 
 		// Start sensor data generator threads
-		StartSensorThreads(dataQueue);
-
-		// Start appropriate data sender thread based on mode
-		StartDataSenderThread(dataQueue);
+		StartSensorThreads();
 	}
 
 	/// <summary>
@@ -372,12 +321,11 @@ public class Wavy
 	/// <summary>
 	/// Starts threads for generating different types of sensor data
 	/// </summary>
-	/// <param name="dataQueue">The shared queue for storing generated data</param>
-	private static void StartSensorThreads(ConcurrentQueue<Dictionary<string, object>> dataQueue)
+	private static void StartSensorThreads()
 	{
 		// Temperature sensor thread
 		Thread temperatureThread = new Thread(() =>
-			GenerateSensorData("Temperature", Config.TemperatureIntervalMs, dataQueue))
+			GenerateSensorData("Temperature", Config.TemperatureIntervalMs))
 		{
 			IsBackground = true,
 			Name = "TemperatureSensor"
@@ -385,7 +333,7 @@ public class Wavy
 
 		// Wind speed sensor thread
 		Thread windSpeedThread = new Thread(() =>
-			GenerateSensorData("WindSpeed", Config.WindSpeedIntervalMs, dataQueue))
+			GenerateSensorData("WindSpeed", Config.WindSpeedIntervalMs))
 		{
 			IsBackground = true,
 			Name = "WindSpeedSensor"
@@ -393,7 +341,7 @@ public class Wavy
 
 		// Frequency sensor thread
 		Thread frequencyThread = new Thread(() =>
-			GenerateSensorData("Frequency", Config.FrequencyIntervalMs, dataQueue))
+			GenerateSensorData("Frequency", Config.FrequencyIntervalMs))
 		{
 			IsBackground = true,
 			Name = "FrequencySensor"
@@ -401,7 +349,7 @@ public class Wavy
 
 		// Decibels sensor thread
 		Thread decibelsThread = new Thread(() =>
-			GenerateSensorData("Decibels", Config.DecibelsIntervalMs, dataQueue))
+			GenerateSensorData("Decibels", Config.DecibelsIntervalMs))
 		{
 			IsBackground = true,
 			Name = "DecibelsSensor"
@@ -417,33 +365,6 @@ public class Wavy
 		windSpeedThread.Start();
 		frequencyThread.Start();
 		decibelsThread.Start();
-	}
-
-	/// <summary>
-	/// Starts the appropriate data sender thread based on the configured mode
-	/// </summary>
-	/// <param name="dataQueue">The shared queue containing sensor data</param>
-	private static void StartDataSenderThread(ConcurrentQueue<Dictionary<string, object>> dataQueue)
-	{
-		Thread dataSenderThread;
-
-		if (Config.UseHttpLikeMode)
-		{
-			dataSenderThread = new Thread(() => RunHttpLikeMode(dataQueue))
-			{
-				Name = "HttpLikeModeSender"
-			};
-		}
-		else
-		{
-			dataSenderThread = new Thread(() => RunContinuousConnectionMode(dataQueue))
-			{
-				Name = "ContinuousConnectionSender"
-			};
-		}
-
-		RegisterThread(dataSenderThread);
-		dataSenderThread.Start();
 	}
 
 	/// <summary>
@@ -465,7 +386,10 @@ public class Wavy
 		Console.WriteLine("Shutting down threads...");
 
 		WaitForThreadsToTerminate();
-		SendFinalDisconnection();
+
+		// Cleanup ZeroMQ resources
+		PubSubConfig.Cleanup();
+		NetMQConfig.Cleanup();
 
 		Console.WriteLine("Shutdown complete.");
 	}
@@ -488,29 +412,6 @@ public class Wavy
 			}
 		}
 	}
-
-	/// <summary>
-	/// Sends final disconnection message if in continuous connection mode
-	/// </summary>
-	private static void SendFinalDisconnection()
-	{
-		if (!Config.UseHttpLikeMode)
-		{
-			try
-			{
-				using (TcpClient client = new TcpClient(Config.AggregatorIp, Config.AggregatorPort))
-				using (NetworkStream stream = client.GetStream())
-				{
-					SendDisconnection(stream);
-				}
-			}
-			catch (Exception ex)
-			{
-				Console.WriteLine($"Error sending disconnection message: {ex.Message}");
-			}
-		}
-	}
-
 
 	/// <summary>
 	/// Registers a thread for lifecycle management
@@ -569,11 +470,6 @@ public class Wavy
 	{
 		switch (key)
 		{
-			case ConsoleKey.M:
-				Config.UseHttpLikeMode = !Config.UseHttpLikeMode;
-				Console.WriteLine($"Connection mode changed to: {(Config.UseHttpLikeMode ? "HTTP-like" : "Continuous connection")}");
-				Console.WriteLine("Restart application for the change to take effect.");
-				break;
 			case ConsoleKey.V:
 				Config.VerboseMode = !Config.VerboseMode;
 				Console.WriteLine($"Verbose mode: {(Config.VerboseMode ? "ON" : "OFF")}");
@@ -596,8 +492,15 @@ public class Wavy
 			case ConsoleKey.W:
 				ClearScreenAndShowMenu();
 				break;
+
+			// debug functions
+			case ConsoleKey.F:
+				Console.WriteLine("Forcing default subscriptions...");
+				PubSubConfig.ForceAddDefaultSubscriptions();
+				break;
 		}
 	}
+
 
 	/// <summary>
 	/// Displays information about active threads and their runtime
@@ -632,15 +535,9 @@ public class Wavy
 	{
 		Console.Clear();
 		Console.WriteLine($"Wavy client starting (ID: {wavyId})");
-		Console.WriteLine($"Mode: {(Config.UseHttpLikeMode ? "HTTP-like" : "Continuous connection")}");
-		Console.WriteLine($"Connecting to Aggregator at {Config.AggregatorIp}:{Config.AggregatorPort}");
-		Console.WriteLine("\nAvailable Commands:");
-		Console.WriteLine("Press 'M' to toggle connection mode");
-		Console.WriteLine("Press 'V' to toggle verbose mode");
-		Console.WriteLine("Press 'T' to show active threads");
-		Console.WriteLine("Press 'S' to save current configuration");
-		Console.WriteLine("Press 'W' to clear screen");
-		Console.WriteLine("Press 'Q' to quit");
+		Console.WriteLine($"Publishing on {Config.PublisherAddress}");
+		Console.WriteLine($"Subscription manager on {Config.SubscriptionManagerAddress}");
+		DisplayCommandMenu();
 	}
 
 	#endregion
@@ -669,26 +566,28 @@ public class Wavy
 		return new Dictionary<string, object>
 		{
 			{ "DataType", dataType },
-			{ "Value", (long)value } // Cast to long to match Aggregator expectation
-        };
+			{ "Value", (long)value }, // Cast to long for consistent data type
+            { "WavyId", wavyId }
+		};
 	}
 
 	/// <summary>
-	/// Continuously generates sensor data at the specified interval
+	/// Continuously generates sensor data at the specified interval and publishes it via ZeroMQ
 	/// </summary>
 	/// <param name="dataType">The type of sensor data to generate</param>
 	/// <param name="interval">Interval between readings in milliseconds</param>
-	/// <param name="dataQueue">Queue to store the generated data</param>
-	private static void GenerateSensorData(string dataType, int interval, ConcurrentQueue<Dictionary<string, object>> dataQueue)
+	private static void GenerateSensorData(string dataType, int interval)
 	{
 		try
 		{
 			while (isRunning)
 			{
-				// Generate sensor reading and add to queue
+				// Generate sensor reading
 				float value = GenerateRandomValue(40, 0);
 				var data = CreateSensorData(dataType, value);
-				dataQueue.Enqueue(data);
+
+				// Publish via ZeroMQ if there are subscribers
+				PubSubConfig.PublishData(data);
 
 				// Log if verbose mode enabled
 				if (Config.VerboseMode)
@@ -715,491 +614,263 @@ public class Wavy
 
 	#endregion
 
-	#region HTTP-Like Connection Mode
+	#region Pub-Sub Communication
 
 	/// <summary>
-	/// Runs the Wavy client in HTTP-like mode where a new connection is established
-	/// for each data transmission
+	/// Manages publish-subscribe communication settings and operations
 	/// </summary>
-	/// <param name="dataQueue">Queue containing sensor data to be transmitted</param>
-	private static void RunHttpLikeMode(ConcurrentQueue<Dictionary<string, object>> dataQueue)
+	private static class PubSubConfig
 	{
-		try
+		// List of all available data types the Wavy can produce
+		public static readonly HashSet<string> AvailableDataTypes = new HashSet<string>(new string[]
 		{
-			Console.WriteLine("Running in HTTP-like mode");
+		"Temperature",
+		"WindSpeed",
+		"Frequency",
+		"Decibels"
+		});
 
-			while (isRunning)
+		// List of data types that have subscribers (controlled by Aggregator)
+		public static HashSet<string> SubscribedDataTypes { get; private set; } = new HashSet<string>();
+
+		// Publisher socket for ZeroMQ communication
+		private static PublisherSocket _publisherSocket;
+		private static readonly object _socketLock = new object();
+
+		/// <summary>
+		/// Initializes the ZeroMQ publisher socket once during application startup
+		/// </summary>
+		public static void InitializePublisher()
+		{
+			lock (_socketLock)
 			{
-				// Send data to aggregator
-				SendAggregatedSensorDataHttpLike(dataQueue);
-
-				// Wait for the next transmission interval, checking isRunning periodically
-				for (int i = 0; i < Config.DataTransmissionIntervalMs && isRunning; i += 100)
+				if (_publisherSocket == null)
 				{
-					Thread.Sleep(100);
+					_publisherSocket = new PublisherSocket();
+					_publisherSocket.Options.SendHighWatermark = 1000;
+					_publisherSocket.Bind(Config.PublisherAddress);
+					Console.WriteLine($"Publisher socket bound to {Config.PublisherAddress}");
+
+					// Allow time for subscribers to connect
+					Thread.Sleep(500);
 				}
 			}
 		}
-		catch (Exception ex)
-		{
-			Console.WriteLine($"Error in HTTP-like mode thread: {ex.Message}");
-		}
-		finally
-		{
-			UnregisterThread(Thread.CurrentThread);
-		}
-	}
 
-	/// <summary>
-	/// Sends aggregated sensor data to the Aggregator using an HTTP-like pattern
-	/// (connect, send, receive confirmation, disconnect)
-	/// </summary>
-	/// <param name="dataQueue">Queue containing sensor data to be transmitted</param>
-	private static void SendAggregatedSensorDataHttpLike(ConcurrentQueue<Dictionary<string, object>> dataQueue)
-	{
-		try
+		/// <summary>
+		/// Gets the ZeroMQ publisher socket (initializes it if needed)
+		/// </summary>
+		public static PublisherSocket PublisherSocket
 		{
-			// Aggregate data from queue
-			var aggregatedData = PrepareAggregatedData(dataQueue);
-
-			// Skip sending if no data available
-			if (aggregatedData["Data"] is List<Dictionary<string, object>> dataList && dataList.Count == 0)
+			get
 			{
-				if (Config.VerboseMode)
+				lock (_socketLock)
 				{
-					Console.WriteLine("No data to send");
-				}
-				return;
-			}
-
-			// Serialize data to JSON
-			string json = JsonSerializer.Serialize(aggregatedData);
-
-			// Establish connection to aggregator
-			using (TcpClient client = new TcpClient(Config.AggregatorIp, Config.AggregatorPort))
-			{
-				Console.WriteLine($"Connected to Aggregator at {Config.AggregatorIp}:{Config.AggregatorPort}");
-
-				using (NetworkStream stream = client.GetStream())
-				{
-					// Attempt to send data with retries if needed
-					SendDataWithRetries(stream, json, MessageCodes.WavyDataHttpInitial);
+					if (_publisherSocket == null)
+					{
+						InitializePublisher();
+					}
+					return _publisherSocket;
 				}
 			}
 		}
-		catch (Exception ex)
+
+		// DEBUG
+		public static void ForceAddDefaultSubscriptions()
 		{
-			Console.WriteLine($"Error in HTTP-like mode data transmission: {ex.Message}");
+			// Add all available data types as subscribed
+			foreach (var dataType in AvailableDataTypes)
+			{
+				UpdateSubscription(dataType, true);
+				Console.WriteLine($"FORCE MODE: Added subscription for {dataType}");
+			}
 		}
-	}
 
-	/// <summary>
-	/// Sends data with retry mechanism until confirmation is received or retry limit reached
-	/// </summary>
-	/// <param name="stream">The network stream to send data through</param>
-	/// <param name="json">The JSON data to send</param>
-	/// <param name="initialCode">The message code for initial send</param>
-	/// <returns>True if data was successfully sent and confirmed, false otherwise</returns>
-	private static bool SendDataWithRetries(NetworkStream stream, string json, int initialCode)
-	{
-		bool confirmed = false;
-		int retryCount = 0;
-
-		// Send data with retry mechanism until confirmation is received or max retries reached
-		while (!confirmed && retryCount < Config.MaxRetryAttempts && isRunning)
+		/// <summary>
+		/// Initializes subscriptions - starts with an empty set. 
+		/// All subscriptions will be controlled by the Aggregator.
+		/// </summary>
+		public static void LoadSubscriptions()
 		{
 			try
 			{
-				// Use appropriate message code (initial or resend)
-				int messageCode = (retryCount == 0) ? initialCode : MessageCodes.WavyDataResend;
+				// Initialize publisher socket first to prevent multiple binds
+				InitializePublisher();
 
-				// Send data
-				SendMessage(stream, json, messageCode);
-				Console.WriteLine("Sent aggregated sensor data to Aggregator.");
+				// Start with no subscriptions - Aggregator will send subscription requests
+				SubscribedDataTypes.Clear();
 
-				if (Config.VerboseMode)
-				{
-					Console.WriteLine($"Data: {json}");
-				}
-
-				// Wait for confirmation
-				confirmed = WaitForConfirmation(stream, MessageCodes.AggregatorConfirmation);
-
-				// If not confirmed, prepare for retry
-				if (!confirmed)
-				{
-					retryCount++;
-					Console.WriteLine($"No confirmation received, retry {retryCount}/{Config.MaxRetryAttempts}...");
-					Thread.Sleep(Config.RetryIntervalMs);
-				}
+				Console.WriteLine("Subscription system initialized. Waiting for Aggregator subscription requests.");
 			}
 			catch (Exception ex)
 			{
-				retryCount++;
-				Console.WriteLine($"Error sending data: {ex.Message}");
-				if (retryCount < Config.MaxRetryAttempts)
+				Console.WriteLine($"Error initializing subscription system: {ex.Message}");
+			}
+		}
+
+		/// <summary>
+		/// Publishes a data item using ZeroMQ if there are subscribers for its type
+		/// </summary>
+		public static void PublishData(Dictionary<string, object> data)
+		{
+			if (data == null) return;
+
+			string dataType = data["DataType"].ToString();
+
+			// Only publish if this data type has subscribers
+			if (SubscribedDataTypes.Contains(dataType))
+			{
+				try
 				{
-					Console.WriteLine($"Retrying in {Config.RetryIntervalMs / 1000} seconds...");
-					Thread.Sleep(Config.RetryIntervalMs);
+					// Add topic (data type) and serialized message
+					string json = JsonSerializer.Serialize(data);
+
+					lock (_socketLock)
+					{
+						// ZeroMQ multipart message: first frame is topic, second is data
+						PublisherSocket.SendMoreFrame(dataType).SendFrame(json);
+					}
+
+					if (Config.VerboseMode)
+					{
+						Console.WriteLine($"Published {dataType} data: {json}");
+					}
+				}
+				catch (Exception ex)
+				{
+					Console.WriteLine($"Error publishing {dataType} data: {ex.Message}");
+				}
+			}
+			else if (Config.VerboseMode)
+			{
+				Console.WriteLine($"Skipped publishing {dataType} - no subscribers");
+			}
+		}
+
+		/// <summary>
+		/// Updates the list of subscribed data types based on Aggregator messages
+		/// </summary>
+		public static void UpdateSubscription(string dataType, bool isSubscribing)
+		{
+			if (isSubscribing)
+			{
+				if (SubscribedDataTypes.Add(dataType))
+				{
+					Console.WriteLine($"Added subscription for data type: {dataType}");
+				}
+			}
+			else
+			{
+				if (SubscribedDataTypes.Remove(dataType))
+				{
+					Console.WriteLine($"Removed subscription for data type: {dataType}");
 				}
 			}
 		}
 
-		// Log if all attempts failed
-		if (!confirmed && retryCount >= Config.MaxRetryAttempts)
+		/// <summary>
+		/// Clean up ZeroMQ resources
+		/// </summary>
+		public static void Cleanup()
 		{
-			Console.WriteLine($"Failed to send data after {Config.MaxRetryAttempts} attempts. Data discarded.");
+			lock (_socketLock)
+			{
+				if (_publisherSocket != null)
+				{
+					_publisherSocket.Dispose();
+					_publisherSocket = null;
+				}
+			}
 		}
-
-		return confirmed;
 	}
 
-	#endregion
-
-	#region Continuous Connection Mode
-
 	/// <summary>
-	/// Runs the Wavy client in continuous connection mode where a single
-	/// connection is maintained for multiple data transmissions
+	/// Listens for subscription requests from Aggregators
 	/// </summary>
-	/// <param name="dataQueue">Queue containing sensor data to be transmitted</param>
-	private static void RunContinuousConnectionMode(ConcurrentQueue<Dictionary<string, object>> dataQueue)
+	private static void StartSubscriptionListener()
 	{
-		try
+		Thread subscriptionThread = new Thread(() =>
 		{
-			Console.WriteLine("Running in continuous connection mode");
-
-			while (isRunning)
+			try
 			{
-				try
+				using (var responseSocket = new ResponseSocket())
 				{
-					// Establish connection to aggregator
-					using (TcpClient client = new TcpClient(Config.AggregatorIp, Config.AggregatorPort))
+					responseSocket.Bind(Config.SubscriptionManagerAddress);
+					Console.WriteLine($"Subscription listener started on {Config.SubscriptionManagerAddress}");
+
+					while (isRunning)
 					{
-						Console.WriteLine($"Connected to Aggregator at {Config.AggregatorIp}:{Config.AggregatorPort}");
-
-						using (NetworkStream stream = client.GetStream())
+						try
 						{
-							// Send initial connection request
-							SendConnection(stream);
+							// This will block until a message is received
+							string message = responseSocket.ReceiveFrameString();
 
-							// Send data periodically while connection is maintained
-							while (isRunning && client.Connected)
+							try
 							{
-								SendAggregatedSensorDataContinuous(stream, dataQueue);
-
-								// Wait for next transmission interval
-								for (int i = 0; i < Config.DataTransmissionIntervalMs && isRunning; i += 100)
+								var request = JsonSerializer.Deserialize<Dictionary<string, object>>(message);
+								if (request != null &&
+									request.TryGetValue("action", out object actionObj) &&
+									request.TryGetValue("dataType", out object dataTypeObj))
 								{
-									Thread.Sleep(100);
+									string action = actionObj.ToString();
+									string dataType = dataTypeObj.ToString();
+
+									if (action == "subscribe")
+									{
+										PubSubConfig.UpdateSubscription(dataType, true);
+										responseSocket.SendFrame("Subscribed");
+										Console.WriteLine($"Received subscription request for {dataType}");
+									}
+									else if (action == "unsubscribe")
+									{
+										PubSubConfig.UpdateSubscription(dataType, false);
+										responseSocket.SendFrame("Unsubscribed");
+										Console.WriteLine($"Received unsubscription request for {dataType}");
+									}
+									else
+									{
+										responseSocket.SendFrame("Unknown action");
+									}
 								}
+								else
+								{
+									responseSocket.SendFrame("Invalid request format");
+								}
+							}
+							catch (Exception ex)
+							{
+								Console.WriteLine($"Error processing subscription request: {ex.Message}");
+								responseSocket.SendFrame("Error processing request");
+							}
+						}
+						catch (Exception ex)
+						{
+							if (isRunning) // Only log if not shutting down
+							{
+								Console.WriteLine($"Socket error: {ex.Message}");
+								Thread.Sleep(1000); // Avoid tight loop on error
 							}
 						}
 					}
 				}
-				catch (Exception ex)
-				{
-					Console.WriteLine($"Connection error: {ex.Message}");
-					Console.WriteLine("Retrying connection in 5 seconds...");
-					Thread.Sleep(5000);
-				}
 			}
-
-			// Send disconnection notification when exiting
-			SendFinalDisconnection();
-		}
-		catch (Exception ex)
-		{
-			Console.WriteLine($"Error in continuous connection mode thread: {ex.Message}");
-		}
-		finally
-		{
-			UnregisterThread(Thread.CurrentThread);
-		}
-	}
-
-	/// <summary>
-	/// Sends aggregated sensor data over an existing connection in continuous mode
-	/// </summary>
-	/// <param name="stream">The network stream to send data through</param>
-	/// <param name="dataQueue">Queue containing sensor data to be transmitted</param>
-	private static void SendAggregatedSensorDataContinuous(NetworkStream stream, ConcurrentQueue<Dictionary<string, object>> dataQueue)
-	{
-		try
-		{
-			// Prepare aggregated data from queue
-			var aggregatedData = PrepareAggregatedData(dataQueue);
-
-			// Skip if no data to send
-			if (aggregatedData["Data"] is List<Dictionary<string, object>> dataList && dataList.Count == 0)
+			catch (Exception ex)
 			{
-				if (Config.VerboseMode)
-				{
-					Console.WriteLine("No data to send");
-				}
-				return;
+				Console.WriteLine($"Subscription listener error: {ex.Message}");
 			}
-
-			// Serialize the data to JSON
-			string json = JsonSerializer.Serialize(aggregatedData);
-
-			bool confirmed = false;
-			int retryCount = 0;
-
-			// Send data with retry mechanism until confirmation is received
-			while (!confirmed && retryCount < Config.MaxRetryAttempts && isRunning)
+			finally
 			{
-				try
-				{
-					// Use appropriate message code based on retry count
-					int messageCode = (retryCount == 0) ?
-						MessageCodes.WavyDataInitial :
-						MessageCodes.WavyDataResend;
-
-					SendMessage(stream, json, messageCode);
-					Console.WriteLine("Sent aggregated sensor data to Aggregator.");
-
-					if (Config.VerboseMode)
-					{
-						Console.WriteLine($"Data: {json}");
-					}
-
-					confirmed = WaitForConfirmation(stream, MessageCodes.AggregatorConfirmation);
-
-					// Handle retry if not confirmed
-					if (!confirmed)
-					{
-						retryCount++;
-						Console.WriteLine($"No confirmation received, retry {retryCount}/{Config.MaxRetryAttempts}...");
-						Thread.Sleep(Config.RetryIntervalMs);
-					}
-				}
-				catch (Exception ex)
-				{
-					retryCount++;
-					Console.WriteLine($"Error sending data: {ex.Message}");
-					if (retryCount < Config.MaxRetryAttempts)
-					{
-						Console.WriteLine($"Retrying in {Config.RetryIntervalMs / 1000} seconds...");
-						Thread.Sleep(Config.RetryIntervalMs);
-					}
-					else
-					{
-						throw; // Re-throw to signal connection loss
-					}
-				}
+				UnregisterThread(Thread.CurrentThread);
 			}
-
-			// Signal connection failure if max retries reached
-			if (!confirmed && retryCount >= Config.MaxRetryAttempts)
-			{
-				Console.WriteLine($"Failed to send data after {Config.MaxRetryAttempts} attempts. Data discarded.");
-				throw new Exception("Communication with Aggregator failed");
-			}
-		}
-		catch (Exception ex)
+		})
 		{
-			Console.WriteLine($"Error in continuous connection mode data transmission: {ex.Message}");
-			throw; // Re-throw to signal connection loss
-		}
-	}
-
-	#endregion
-
-	#region Network Utilities
-
-	/// <summary>
-	/// Aggregates and prepares sensor data from the queue for transmission
-	/// </summary>
-	/// <param name="dataQueue">Queue containing sensor data to be transmitted</param>
-	/// <returns>Dictionary containing aggregated data ready for serialization</returns>
-	private static Dictionary<string, object> PrepareAggregatedData(ConcurrentQueue<Dictionary<string, object>> dataQueue)
-	{
-		// Create container for aggregated data
-		var aggregatedData = new Dictionary<string, object>
-		{
-			{ "WavyId", wavyId },
-			{ "Data", new List<Dictionary<string, object>>() }
+			IsBackground = true,
+			Name = "SubscriptionListener"
 		};
 
-		var dataList = (List<Dictionary<string, object>>)aggregatedData["Data"];
-
-		// Dequeue and process all available items
-		while (dataQueue.TryDequeue(out var data))
-		{
-			// Try to find existing data of the same type to aggregate
-			var existingData = dataList.Find(d => d["DataType"].ToString() == data["DataType"].ToString());
-			if (existingData != null)
-			{
-				// Aggregate values for the same data type
-				existingData["Value"] = (long)existingData["Value"] + (long)data["Value"];
-			}
-			else
-			{
-				// Add new data type to the list
-				dataList.Add(data);
-			}
-		}
-
-		return aggregatedData;
-	}
-
-	/// <summary>
-	/// Sends a connection request to the Aggregator with the Wavy ID
-	/// </summary>
-	/// <param name="stream">The network stream to send the request through</param>
-	private static void SendConnection(NetworkStream stream)
-	{
-		try
-		{
-			// Prepare message with code and Wavy ID
-			byte[] codeBytes = BitConverter.GetBytes(MessageCodes.WavyConnect);
-			byte[] idBytes = Encoding.UTF8.GetBytes(wavyId);
-
-			// Combine code and ID into a single message
-			byte[] data = new byte[codeBytes.Length + idBytes.Length];
-			Buffer.BlockCopy(codeBytes, 0, data, 0, codeBytes.Length);
-			Buffer.BlockCopy(idBytes, 0, data, codeBytes.Length, idBytes.Length);
-
-			// Send the message
-			stream.Write(data, 0, data.Length);
-			Console.WriteLine($"Sent connection code with ID: {wavyId}");
-
-			// Wait for acknowledgment from Aggregator
-			bool confirmed = WaitForConfirmation(stream, MessageCodes.AggregatorConfirmation);
-			if (confirmed)
-			{
-				Console.WriteLine("Connection acknowledged by Aggregator.");
-			}
-			else
-			{
-				Console.WriteLine("Connection not acknowledged by Aggregator.");
-				throw new Exception("Connection not acknowledged");
-			}
-		}
-		catch (Exception ex)
-		{
-			Console.WriteLine($"Error sending connection request: {ex.Message}");
-			throw;
-		}
-	}
-
-	/// <summary>
-	/// Sends a disconnection request to the Aggregator
-	/// </summary>
-	/// <param name="stream">The network stream to send the request through</param>
-	private static void SendDisconnection(NetworkStream stream)
-	{
-		try
-		{
-			// Prepare message with code and Wavy ID
-			byte[] codeBytes = BitConverter.GetBytes(MessageCodes.WavyDisconnect);
-			byte[] idBytes = Encoding.UTF8.GetBytes(wavyId);
-
-			// Combine code and ID into a single message
-			byte[] data = new byte[codeBytes.Length + idBytes.Length];
-			Buffer.BlockCopy(codeBytes, 0, data, 0, codeBytes.Length);
-			Buffer.BlockCopy(idBytes, 0, data, codeBytes.Length, idBytes.Length);
-
-			// Send the message
-			stream.Write(data, 0, data.Length);
-			Console.WriteLine($"Sent disconnection code with ID: {wavyId}");
-
-			// Wait for acknowledgment from Aggregator
-			bool confirmed = WaitForConfirmation(stream, MessageCodes.AggregatorConfirmation);
-			if (confirmed)
-			{
-				Console.WriteLine("Disconnection acknowledged by Aggregator.");
-			}
-			else
-			{
-				Console.WriteLine("Disconnection not acknowledged by Aggregator.");
-			}
-		}
-		catch (Exception ex)
-		{
-			Console.WriteLine($"Error sending disconnection request: {ex.Message}");
-			throw;
-		}
-	}
-
-	/// <summary>
-	/// Sends a message with a specific code to the Aggregator
-	/// </summary>
-	/// <param name="stream">The network stream to send the message through</param>
-	/// <param name="message">The message content</param>
-	/// <param name="code">The protocol message code</param>
-	private static void SendMessage(NetworkStream stream, string message, int code)
-	{
-		try
-		{
-			// Prepare message with code and content
-			byte[] codeBytes = BitConverter.GetBytes(code);
-			byte[] messageBytes = Encoding.UTF8.GetBytes(message);
-
-			// Combine code and content into a single message
-			byte[] data = new byte[codeBytes.Length + messageBytes.Length];
-			Buffer.BlockCopy(codeBytes, 0, data, 0, codeBytes.Length);
-			Buffer.BlockCopy(messageBytes, 0, data, codeBytes.Length, messageBytes.Length);
-
-			// Send the message
-			stream.Write(data, 0, data.Length);
-
-			if (Config.VerboseMode)
-			{
-				Console.WriteLine($"Sent message with code: {code}");
-			}
-		}
-		catch (Exception ex)
-		{
-			Console.WriteLine($"Error sending message: {ex.Message}");
-			throw;
-		}
-	}
-
-	/// <summary>
-	/// Waits for a confirmation message with the expected code from the Aggregator
-	/// </summary>
-	/// <param name="stream">The network stream to read from</param>
-	/// <param name="expectedCode">The expected confirmation code</param>
-	/// <returns>True if the expected code was received, false otherwise</returns>
-	private static bool WaitForConfirmation(NetworkStream stream, int expectedCode)
-	{
-		try
-		{
-			// Set a read timeout to prevent hanging indefinitely
-			stream.ReadTimeout = Config.ConfirmationTimeoutMs;
-
-			// Read exactly 4 bytes for the code
-			byte[] buffer = new byte[4];
-			int bytesRead = stream.Read(buffer, 0, buffer.Length);
-
-			if (bytesRead == 4)
-			{
-				int code = BitConverter.ToInt32(buffer, 0);
-
-				if (Config.VerboseMode)
-				{
-					Console.WriteLine($"Received confirmation code: {code}, expected: {expectedCode}");
-				}
-
-				return code == expectedCode;
-			}
-
-			if (Config.VerboseMode)
-			{
-				Console.WriteLine($"Received incomplete confirmation: {bytesRead} bytes, expected 4 bytes");
-			}
-
-			return false;
-		}
-		catch (Exception ex)
-		{
-			Console.WriteLine($"Error waiting for confirmation: {ex.Message}");
-			return false;
-		}
+		RegisterThread(subscriptionThread);
+		subscriptionThread.Start();
 	}
 
 	#endregion
 }
-

@@ -786,16 +786,23 @@ namespace OceanMonitorSystem
 		/// </summary>
 		static string ExtractWavyId(JsonElement element)
 		{
-			if (element.TryGetProperty("WavyId", out JsonElement wavyIdElement))
+			if (element.TryGetProperty("WavyId", out JsonElement wavyIdElement) &&
+				wavyIdElement.ValueKind == JsonValueKind.String)
 			{
-				return wavyIdElement.GetString();
+				string wavyId = wavyIdElement.GetString();
+				return string.IsNullOrEmpty(wavyId) ? "Unknown" : wavyId;
 			}
-			else if (element.TryGetProperty("wavyId", out wavyIdElement))
+			else if (element.TryGetProperty("wavyId", out wavyIdElement) &&
+					 wavyIdElement.ValueKind == JsonValueKind.String)
 			{
-				return wavyIdElement.GetString();
+				string wavyId = wavyIdElement.GetString();
+				return string.IsNullOrEmpty(wavyId) ? "Unknown" : wavyId;
 			}
 
-			Console.WriteLine("[WARNING] No Wavy ID found in measurement, using 'Unknown'");
+			if (verboseMode)
+			{
+				Console.WriteLine($"[WARNING] No Wavy ID found in measurement: {element.GetRawText()}");
+			}
 			return "Unknown";
 		}
 
@@ -804,15 +811,42 @@ namespace OceanMonitorSystem
 		/// </summary>
 		static bool TryExtractValue(JsonElement element, out double value)
 		{
-			if (element.TryGetProperty("Value", out JsonElement valueElement))
+			// Debug the incoming JSON
+			if (verboseMode)
 			{
-				return TryGetDoubleValue(valueElement, out value);
-			}
-			else if (element.TryGetProperty("value", out valueElement))
-			{
-				return TryGetDoubleValue(valueElement, out value);
+				Console.WriteLine($"Extracting value from element: {element.GetRawText()}");
 			}
 
+			// First try the capitalized property name
+			if (element.TryGetProperty("Value", out JsonElement valueElement))
+			{
+				bool success = TryGetDoubleValue(valueElement, out value);
+				if (success)
+				{
+					Console.WriteLine($"Extracted Value: {value}");
+				}
+				return success;
+			}
+			// Then try lowercase
+			else if (element.TryGetProperty("value", out valueElement))
+			{
+				bool success = TryGetDoubleValue(valueElement, out value);
+				if (success)
+				{
+					Console.WriteLine($"Extracted value: {value}");
+				}
+				return success;
+			}
+
+			// If no property found, try direct JSON value if the element itself is a number
+			if (element.ValueKind == JsonValueKind.Number)
+			{
+				value = element.GetDouble();
+				Console.WriteLine($"Extracted direct value: {value}");
+				return true;
+			}
+
+			Console.WriteLine($"[WARNING] No value property found in: {element.GetRawText()}");
 			value = 0;
 			return false;
 		}
