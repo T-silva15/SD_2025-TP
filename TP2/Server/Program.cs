@@ -1,15 +1,18 @@
-﻿using System;
+﻿using Google.Protobuf.WellKnownTypes;
+using Grpc.Net.Client;
+using Microsoft.Data.SqlClient;
+using Oceanmonitor;
+using Spectre.Console;
+using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
-using Microsoft.Data.SqlClient;
 using System.Threading.Tasks;
-using Grpc.Net.Client;
-using Google.Protobuf.WellKnownTypes;
-using Oceanmonitor;
 
 namespace OceanMonitorSystem
 {
@@ -24,7 +27,7 @@ namespace OceanMonitorSystem
 		private const string PYTHON_GRPC_SERVER_ADDRESS = "http://localhost:50051";
 		private static readonly GrpcChannel channel = GrpcChannel.ForAddress(PYTHON_GRPC_SERVER_ADDRESS);
 		private static readonly DataCalculationService.DataCalculationServiceClient grpcClient = new DataCalculationService.DataCalculationServiceClient(channel);
-
+		private static Process? PythonServerProcess = null;
 
 
 		/// <summary>
@@ -55,7 +58,7 @@ namespace OceanMonitorSystem
 		/// <summary>
 		/// Database connection string for SQL Server
 		/// </summary>
-		static string connectionString = "Server=(localdb)\\mssqllocaldb;Database=OceanMonitor;Trusted_Connection=True;TrustServerCertificate=True;";
+		static string connectionString = "Server=(localdb)\\mssqllocaldb;Database=OceanMonitor;TPythoned_Connection=True;TPythonServerCertificate=True;";
 
 		/// <summary>
 		/// Protocol message codes used in the Aggregator-Server communication protocol
@@ -76,6 +79,97 @@ namespace OceanMonitorSystem
 
 		#endregion
 
+		#region State Management
+
+		/// <summary>
+		/// Controls UI display mode to prevent console output during menu interactions
+		/// </summary>
+		static bool inMenuMode = false;
+
+		/// <summary>
+		/// Queue to store log messages during menu mode
+		/// </summary>
+		static readonly ConcurrentQueue<string> logMessages = new ConcurrentQueue<string>();
+
+		/// <summary>
+		/// Thread for displaying logs in the background
+		/// </summary>
+		static Thread? logDisplayThread = null;
+
+		/// <summary>
+		/// Escapes markup characters in a string for Spectre.Console
+		/// </summary>
+		static string EscapeMarkup(string text)
+		{
+			return text.Replace("[", "[[").Replace("]", "]]");
+		}
+
+		/// <summary>
+		/// Logs a message with controlled output based on the current UI mode
+		/// </summary>
+		static void Log(string message, bool isVerboseOnly = false)
+		{
+			if (isVerboseOnly && !verboseMode)
+				return;
+
+			string formattedMessage = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
+			logMessages.Enqueue(formattedMessage);
+
+			// Only display immediately if not in menu mode and log thread isn't active
+			if (!inMenuMode && logDisplayThread == null)
+			{
+				AnsiConsole.MarkupLine($"[gray]{EscapeMarkup(formattedMessage)}[/]");
+			}
+		}
+
+		/// <summary>
+		/// Starts the log display thread that shows logs when not in menu mode
+		/// </summary>
+		static void StartLogDisplayThread()
+		{
+			if (logDisplayThread != null)
+				return;
+
+			logDisplayThread = new Thread(() =>
+			{
+				try
+				{
+					while (isRunning)
+					{
+						if (!inMenuMode && logMessages.TryDequeue(out string? message))
+						{
+							// Use AnsiConsole for richer formatting
+							AnsiConsole.MarkupLine($"[gray]{EscapeMarkup(message)}[/]");
+						}
+						else
+						{
+							Thread.Sleep(100);
+						}
+					}
+				}
+				catch (Exception ex)
+				{
+					AnsiConsole.MarkupLine($"[red]Error in log display thread: {ex.Message}[/]");
+				}
+			})
+			{
+				IsBackground = true,
+				Name = "LogDisplayThread"
+			};
+
+			logDisplayThread.Start();
+		}
+
+		/// <summary>
+		/// Clears any pending log messages in the queue
+		/// </summary>
+		static void ClearLogQueue()
+		{
+			while (logMessages.TryDequeue(out _)) { }
+		}
+
+		#endregion
+
 		#region Entry Point and Main Thread Management
 
 		/// <summary>
@@ -86,9 +180,25 @@ namespace OceanMonitorSystem
 			Thread keyboardThread = new Thread(MonitorKeyboard) { IsBackground = true, Name = "KeyboardMonitor" };
 			keyboardThread.Start();
 
+			// Initialize log display thread
+			StartLogDisplayThread();
+
+			// Clear the console and show a nice splash screen
+			AnsiConsole.Clear();
+			AnsiConsole.Write(
+				new FigletText("OceanServer")
+					.Color(Color.Green)
+					.Centered());
+
+			AnsiConsole.Write(new Rule("[blue]Ocean Monitor System[/]").RuleStyle("grey").Centered());
+
+			// Start the TCP listener
 			TcpListener server = new TcpListener(IPAddress.Parse("127.0.0.1"), PORT);
 			server.Start();
-			Console.WriteLine($"[SERVER] Listening on port {PORT}...");
+
+			Log($"Server listening on port {PORT}");
+			AnsiConsole.MarkupLine($"[bold green]Server[/] started and listening on port [yellow]{PORT}[/]");
+
 			DisplayCommandMenu();
 
 			while (isRunning)
@@ -105,28 +215,40 @@ namespace OceanMonitorSystem
 				}
 				catch (Exception ex)
 				{
-					Console.WriteLine($"[ERROR] Failed to accept client connection: {ex.Message}");
+					if (isRunning) // Only log if not shutting down
+					{
+						Log($"Failed to accept client connection: {ex.Message}");
+					}
 					Thread.Sleep(1000);
 				}
 			}
 
 			server.Stop();
-			Console.WriteLine("[SERVER] Shutdown complete.");
+			Log("Shutdown complete.");
 		}
 
 		/// <summary>
-		/// Displays the available commands in the console
+		/// Displays available commands in the console using Spectre.Console
 		/// </summary>
 		static void DisplayCommandMenu()
 		{
-			Console.WriteLine("\nAvailable Commands:");
-			Console.WriteLine("Press 'A' to show connected aggregators");
-			Console.WriteLine("Press 'D' to show database statistics");
-			Console.WriteLine("Press 'V' to toggle verbose mode");
-			Console.WriteLine("Press 'C' to modify connection string");
-			Console.WriteLine("Press 'I' to check for inactive devices");
-			Console.WriteLine("Press 'W' to clear screen");
-			Console.WriteLine("Press 'Q' to quit");
+			var table = new Table()
+				.BorderColor(Color.Grey)
+				.Title("[yellow]Available Commands[/]")
+				.AddColumn(new TableColumn("[aqua]Key[/]").Centered())
+				.AddColumn(new TableColumn("[green]Action[/]"));
+
+			table.AddRow("[yellow]A[/]", "Show connected aggregators");
+			table.AddRow("[yellow]D[/]", "Show database statistics");
+			table.AddRow("[yellow]V[/]", "Toggle verbose mode");
+			table.AddRow("[yellow]C[/]", "Modify connection string");
+			table.AddRow("[yellow]I[/]", "Check for inactive devices");
+			table.AddRow("[yellow]P[/]", "Run Python gRPC calculation server");
+			table.AddRow("[yellow]K[/]", "Kill Python gRPC calculation server");
+			table.AddRow("[yellow]W[/]", "Clear screen");
+			table.AddRow("[yellow]Q[/]", "Quit");
+
+			AnsiConsole.Write(table);
 		}
 
 		/// <summary>
@@ -149,7 +271,7 @@ namespace OceanMonitorSystem
 							break;
 						case ConsoleKey.V:
 							verboseMode = !verboseMode;
-							Console.WriteLine($"Verbose mode: {(verboseMode ? "ON" : "OFF")}");
+							AnsiConsole.MarkupLine($"Verbose mode: {(verboseMode ? "[green]ON[/]" : "[grey]OFF[/]")}");
 							break;
 						case ConsoleKey.C:
 							ModifyConnectionString();
@@ -157,9 +279,16 @@ namespace OceanMonitorSystem
 						case ConsoleKey.I:
 							CheckInactiveDevices();
 							break;
+						case ConsoleKey.P:
+							StartPythonGrpcServer();
+							break;
+						case ConsoleKey.K:
+							KillPythonGrpcServer();
+							break;
 						case ConsoleKey.Q:
-							Console.WriteLine("Shutting down server...");
+							AnsiConsole.MarkupLine("[yellow]Shutting down server...[/]");
 							isRunning = false;
+							Thread.Sleep(500);
 							break;
 						case ConsoleKey.W:
 							ClearScreenAndShowMenu();
@@ -175,25 +304,52 @@ namespace OceanMonitorSystem
 		/// </summary>
 		static void ShowConnectedAggregators()
 		{
-			Console.WriteLine("\n=== Connected Aggregators ===");
-			lock (connectedAggregators)
+			try
 			{
-				if (connectedAggregators.Count == 0)
+				inMenuMode = true;
+				ClearLogQueue();
+				AnsiConsole.Clear();
+
+				AnsiConsole.Write(new Rule("[yellow]Connected Aggregators[/]").RuleStyle("blue").Centered());
+
+				lock (connectedAggregators)
 				{
-					Console.WriteLine("No aggregators connected.");
-				}
-				else
-				{
-					foreach (var kvp in connectedAggregators)
+					if (connectedAggregators.Count == 0)
 					{
-						TimeSpan connectedFor = DateTime.Now - kvp.Value;
-						Console.WriteLine($"Aggregator ID: {kvp.Key}");
-						Console.WriteLine($"  Connected since: {kvp.Value:HH:mm:ss}");
-						Console.WriteLine($"  Connected for: {connectedFor.Hours}h {connectedFor.Minutes}m {connectedFor.Seconds}s");
+						AnsiConsole.MarkupLine("[grey]No aggregators connected.[/]");
+					}
+					else
+					{
+						var table = new Table()
+							.BorderColor(Color.Blue)
+							.AddColumn(new TableColumn("[green]Aggregator ID[/]"))
+							.AddColumn(new TableColumn("[green]Connected Since[/]"))
+							.AddColumn(new TableColumn("[green]Connected For[/]"));
+
+						foreach (var kvp in connectedAggregators)
+						{
+							TimeSpan connectedFor = DateTime.Now - kvp.Value;
+							string runtime = $"{connectedFor.Hours}h {connectedFor.Minutes}m {connectedFor.Seconds}s";
+
+							table.AddRow(
+								$"[yellow]{kvp.Key}[/]",
+								$"[aqua]{kvp.Value:HH:mm:ss}[/]",
+								runtime);
+						}
+
+						AnsiConsole.Write(table);
 					}
 				}
+
+				AnsiConsole.WriteLine();
+				AnsiConsole.Markup("[yellow]Press any key to return to main menu...[/]");
+				Console.ReadKey(true);
+				ClearScreenAndShowMenu();
 			}
-			Console.WriteLine("============================\n");
+			finally
+			{
+				inMenuMode = false;
+			}
 		}
 
 		/// <summary>
@@ -201,49 +357,72 @@ namespace OceanMonitorSystem
 		/// </summary>
 		static void ShowDatabaseStatistics()
 		{
-			Console.WriteLine("\n=== Database Statistics ===");
 			try
 			{
-				using (var connection = new SqlConnection(connectionString))
+				inMenuMode = true;
+				ClearLogQueue();
+				AnsiConsole.Clear();
+
+				AnsiConsole.Write(new Rule("[yellow]Database Statistics[/]").RuleStyle("blue").Centered());
+
+				try
 				{
-					connection.Open();
-					var tableStats = new Dictionary<string, int>();
-					string[] tables = { "Aggregators", "Wavys", "WavyAggregatorMapping", "Measurements" };
-
-					foreach (var table in tables)
+					using (var connection = new SqlConnection(connectionString))
 					{
-						using (var cmd = new SqlCommand($"SELECT COUNT(*) FROM {table}", connection))
-						{
-							try
-							{
-								int count = (int)cmd.ExecuteScalar();
-								tableStats[table] = count;
-							}
-							catch
-							{
-								tableStats[table] = -1; // Table doesn't exist
-							}
-						}
-					}
+						connection.Open();
+						var tableStats = new Dictionary<string, int>();
+						string[] tableNames = { "Aggregators", "Wavys", "WavyAggregatorMapping", "Measurements", "CalculatedMetrics" };
 
-					foreach (var stat in tableStats)
-					{
-						if (stat.Value >= 0)
+						foreach (var tableName in tableNames)
 						{
-							Console.WriteLine($"Table {stat.Key}: {stat.Value} records");
+							using (var cmd = new SqlCommand($"SELECT COUNT(*) FROM {tableName}", connection))
+							{
+								try
+								{
+									int count = (int)cmd.ExecuteScalar();
+									tableStats[tableName] = count;
+								}
+								catch
+								{
+									tableStats[tableName] = -1; // Table doesn't exist
+								}
+							}
 						}
-						else
+
+						var statsTable = new Table()
+							.BorderColor(Color.Blue)
+							.AddColumn(new TableColumn("[green]Table Name[/]"))
+							.AddColumn(new TableColumn("[green]Records[/]").Centered());
+
+						foreach (var stat in tableStats)
 						{
-							Console.WriteLine($"Table {stat.Key}: Not found");
+							if (stat.Value >= 0)
+							{
+								statsTable.AddRow($"[yellow]{stat.Key}[/]", $"[aqua]{stat.Value:N0}[/]");
+							}
+							else
+							{
+								statsTable.AddRow($"[yellow]{stat.Key}[/]", "[grey]Not found[/]");
+							}
 						}
+
+						AnsiConsole.Write(statsTable);
 					}
 				}
+				catch (Exception ex)
+				{
+					AnsiConsole.MarkupLine($"[red]Error retrieving database statistics: {ex.Message}[/]");
+				}
+
+				AnsiConsole.WriteLine();
+				AnsiConsole.Markup("[yellow]Press any key to return to main menu...[/]");
+				Console.ReadKey(true);
+				ClearScreenAndShowMenu();
 			}
-			catch (Exception ex)
+			finally
 			{
-				Console.WriteLine($"Error retrieving database statistics: {ex.Message}");
+				inMenuMode = false;
 			}
-			Console.WriteLine("==========================\n");
 		}
 
 		/// <summary>
@@ -251,30 +430,62 @@ namespace OceanMonitorSystem
 		/// </summary>
 		static void ModifyConnectionString()
 		{
-			Console.WriteLine($"\nCurrent connection string: {connectionString}");
-			Console.WriteLine("Enter new connection string (or leave empty to cancel):");
-			string input = Console.ReadLine();
+			try
+			{
+				inMenuMode = true;
+				ClearLogQueue();
+				AnsiConsole.Clear();
 
-			if (!string.IsNullOrWhiteSpace(input))
-			{
-				try
+				AnsiConsole.Write(new Rule("[yellow]Database Connection[/]").RuleStyle("blue").Centered());
+				AnsiConsole.MarkupLine($"[bold]Current connection string:[/]");
+
+				var panel = new Panel(connectionString)
+					.Header("Connection String")
+					.Border(BoxBorder.Rounded)
+					.BorderColor(Color.Grey);
+				AnsiConsole.Write(panel);
+
+				string input = AnsiConsole.Ask<string>("[yellow]Enter new connection string[/] [grey](leave empty to cancel):[/]");
+
+				if (!string.IsNullOrWhiteSpace(input))
 				{
-					using (var connection = new SqlConnection(input))
-					{
-						connection.Open();
-						connectionString = input;
-						Console.WriteLine("Connection string updated successfully.");
-					}
+					AnsiConsole.Status()
+						.Start("Testing connection...", ctx =>
+						{
+							ctx.Spinner(Spinner.Known.Dots);
+							ctx.SpinnerStyle(Style.Parse("yellow"));
+
+							try
+							{
+								using (var connection = new SqlConnection(input))
+								{
+									connection.Open();
+									connectionString = input;
+									Thread.Sleep(1000); // Give time to see the status
+								}
+
+								AnsiConsole.MarkupLine("[green]Connection string updated successfully.[/]");
+							}
+							catch (Exception ex)
+							{
+								AnsiConsole.MarkupLine($"[red]Error with new connection string: {ex.Message}[/]");
+								AnsiConsole.MarkupLine("[red]Connection string not updated.[/]");
+							}
+						});
 				}
-				catch (Exception ex)
+				else
 				{
-					Console.WriteLine($"Error with new connection string: {ex.Message}");
-					Console.WriteLine("Connection string not updated.");
+					AnsiConsole.MarkupLine("[yellow]Operation cancelled. Connection string not changed.[/]");
 				}
+
+				AnsiConsole.WriteLine();
+				AnsiConsole.Markup("[yellow]Press any key to return to main menu...[/]");
+				Console.ReadKey(true);
+				ClearScreenAndShowMenu();
 			}
-			else
+			finally
 			{
-				Console.WriteLine("Operation cancelled. Connection string not changed.");
+				inMenuMode = false;
 			}
 		}
 
@@ -283,68 +494,137 @@ namespace OceanMonitorSystem
 		/// </summary>
 		static void CheckInactiveDevices()
 		{
-			Console.WriteLine("\n=== Checking for Inactive Devices ===");
-			DateTime inactiveThreshold = DateTime.Now.AddHours(-InactivityThresholdHours);
-
-			Console.WriteLine($"Removing devices not seen since: {inactiveThreshold:yyyy-MM-dd HH:mm:ss}");
-			Console.WriteLine($"Inactivity threshold: {InactivityThresholdHours} hours");
-
-			lock (dbLock)
+			try
 			{
-				using (var connection = new SqlConnection(connectionString))
+				inMenuMode = true;
+				ClearLogQueue();
+				AnsiConsole.Clear();
+
+				AnsiConsole.Write(new Rule("[yellow]Inactive Device Management[/]").RuleStyle("blue").Centered());
+				DateTime inactiveThreshold = DateTime.Now.AddHours(-InactivityThresholdHours);
+
+				AnsiConsole.MarkupLine($"Devices not seen since: [yellow]{inactiveThreshold:yyyy-MM-dd HH:mm:ss}[/]");
+				AnsiConsole.MarkupLine($"Inactivity threshold: [yellow]{InactivityThresholdHours} hours[/]");
+
+				lock (dbLock)
 				{
-					try
+					using (var connection = new SqlConnection(connectionString))
 					{
-						connection.Open();
-						using (var transaction = connection.BeginTransaction())
+						try
 						{
-							try
+							connection.Open();
+							using (var transaction = connection.BeginTransaction())
 							{
-								// Count inactive devices
-								int inactiveAggregatorsCount = CountInactiveAggregators(connection, transaction, inactiveThreshold);
-								int inactiveWavysCount = CountInactiveWavys(connection, transaction, inactiveThreshold);
-
-								Console.WriteLine($"Found {inactiveAggregatorsCount} inactive Aggregators and {inactiveWavysCount} inactive Wavys");
-
-								if (inactiveAggregatorsCount > 0 || inactiveWavysCount > 0)
+								try
 								{
-									if (ConfirmDeletion())
+									// Count inactive devices
+									int inactiveAggregatorsCount = CountInactiveAggregators(connection, transaction, inactiveThreshold);
+									int inactiveWavysCount = CountInactiveWavys(connection, transaction, inactiveThreshold);
+
+									var table = new Table()
+										.BorderColor(Color.Blue)
+										.AddColumn(new TableColumn("[green]Device Type[/]"))
+										.AddColumn(new TableColumn("[green]Count[/]").Centered());
+
+									table.AddRow("[yellow]Inactive Aggregators[/]", $"[aqua]{inactiveAggregatorsCount}[/]");
+									table.AddRow("[yellow]Inactive Wavys[/]", $"[aqua]{inactiveWavysCount}[/]");
+
+									AnsiConsole.Write(table);
+									AnsiConsole.WriteLine();
+
+									if (inactiveAggregatorsCount > 0 || inactiveWavysCount > 0)
 									{
-										DeleteInactiveDeviceData(connection, transaction, inactiveThreshold);
-										transaction.Commit();
-										Console.WriteLine("Inactive devices successfully removed from the database.");
+										if (AnsiConsole.Confirm("Do you want to remove these inactive devices?", false))
+										{
+											AnsiConsole.Status()
+												.Start("Removing inactive devices...", ctx =>
+												{
+													ctx.Spinner(Spinner.Known.Dots);
+													ctx.SpinnerStyle(Style.Parse("yellow"));
+
+													DeleteInactiveDeviceData(connection, transaction, inactiveThreshold);
+													transaction.Commit();
+													Thread.Sleep(1000); // Show status for a moment
+												});
+
+											AnsiConsole.MarkupLine("[green]Inactive devices successfully removed from the database.[/]");
+										}
+										else
+										{
+											AnsiConsole.MarkupLine("[yellow]Operation cancelled. No devices were removed.[/]");
+											transaction.Rollback();
+										}
 									}
 									else
 									{
-										Console.WriteLine("Operation cancelled. No devices were removed.");
+										AnsiConsole.MarkupLine("[green]No inactive devices found. Nothing to remove.[/]");
 										transaction.Rollback();
 									}
 								}
-								else
+								catch (Exception ex)
 								{
-									Console.WriteLine("No inactive devices found. Nothing to remove.");
 									transaction.Rollback();
+									throw new Exception($"Transaction rolled back: {ex.Message}", ex);
 								}
 							}
-							catch (Exception ex)
-							{
-								transaction.Rollback();
-								throw new Exception($"Transaction rolled back: {ex.Message}", ex);
-							}
 						}
-					}
-					catch (Exception ex)
-					{
-						Console.WriteLine($"[ERROR] Failed to check/remove inactive devices: {ex.Message}");
-						if (ex.InnerException != null)
+						catch (Exception ex)
 						{
-							Console.WriteLine($"[ERROR] Inner exception: {ex.InnerException.Message}");
+							AnsiConsole.MarkupLine($"[red]Failed to check/remove inactive devices: {ex.Message}[/]");
+							if (ex.InnerException != null)
+							{
+								AnsiConsole.MarkupLine($"[red]Inner exception: {ex.InnerException.Message}[/]");
+							}
 						}
 					}
 				}
+
+				AnsiConsole.WriteLine();
+				AnsiConsole.Markup("[yellow]Press any key to return to main menu...[/]");
+				Console.ReadKey(true);
+				ClearScreenAndShowMenu();
+			}
+			finally
+			{
+				inMenuMode = false;
+			}
+		}
+
+		/// <summary>
+		/// Clears the console screen and displays the menu again
+		/// </summary>
+		static void ClearScreenAndShowMenu()
+		{
+			AnsiConsole.Clear();
+
+			AnsiConsole.Write(
+				new FigletText("OceanServer")
+					.Color(Color.Green)
+					.Centered());
+
+			AnsiConsole.Write(new Rule("[blue]Ocean Monitor System[/]").RuleStyle("grey").Centered());
+
+			var statusTable = new Table()
+				.Border(TableBorder.Rounded)
+				.BorderColor(Color.Grey)
+				.AddColumn(new TableColumn("[blue]Property[/]"))
+				.AddColumn(new TableColumn("[green]Value[/]"));
+
+			lock (connectedAggregators)
+			{
+				statusTable.AddRow("Server Port", $"[yellow]{PORT}[/]");
+				statusTable.AddRow("Active Aggregators", $"[yellow]{connectedAggregators.Count}[/]");
+				statusTable.AddRow("Verbose Mode", verboseMode ? "[green]ON[/]" : "[grey]OFF[/]");
+				statusTable.AddRow("Python gRPC Server",
+					PythonServerProcess != null && !PythonServerProcess.HasExited
+					? $"[green]Running (PID: {PythonServerProcess.Id})[/]"
+					: "[grey]Not running[/]");
 			}
 
-			Console.WriteLine("===============================\n");
+			AnsiConsole.Write(statusTable);
+			AnsiConsole.WriteLine();
+
+			DisplayCommandMenu();
 		}
 
 		/// <summary>
@@ -376,24 +656,14 @@ namespace OceanMonitorSystem
 		}
 
 		/// <summary>
-		/// Asks for user confirmation before deleting inactive devices
-		/// </summary>
-		static bool ConfirmDeletion()
-		{
-			Console.Write("Do you want to remove these inactive devices? (y/n): ");
-			string answer = Console.ReadLine()?.ToLower();
-			return answer == "y" || answer == "yes";
-		}
-
-		/// <summary>
 		/// Deletes all data related to inactive devices from the database
 		/// </summary>
 		static void DeleteInactiveDeviceData(SqlConnection connection, SqlTransaction transaction, DateTime threshold)
 		{
 			// Delete measurements from inactive Wavys
 			string deleteMeasurementsFromWavys = @"
-            DELETE FROM Measurements 
-            WHERE WavyID IN (SELECT WavyID FROM Wavys WHERE LastSeen < @threshold)";
+    DELETE FROM Measurements 
+    WHERE WavyID IN (SELECT WavyID FROM Wavys WHERE LastSeen < @threshold)";
 			using (var cmd = new SqlCommand(deleteMeasurementsFromWavys, connection, transaction))
 			{
 				cmd.Parameters.AddWithValue("@threshold", threshold);
@@ -402,8 +672,8 @@ namespace OceanMonitorSystem
 
 			// Delete measurements from inactive Aggregators
 			string deleteMeasurementsFromAggregators = @"
-            DELETE FROM Measurements 
-            WHERE AggregatorID IN (SELECT AggregatorID FROM Aggregators WHERE LastSeen < @threshold)";
+    DELETE FROM Measurements 
+    WHERE AggregatorID IN (SELECT AggregatorID FROM Aggregators WHERE LastSeen < @threshold)";
 			using (var cmd = new SqlCommand(deleteMeasurementsFromAggregators, connection, transaction))
 			{
 				cmd.Parameters.AddWithValue("@threshold", threshold);
@@ -412,9 +682,9 @@ namespace OceanMonitorSystem
 
 			// Delete mappings involving inactive devices
 			string deleteMappings = @"
-            DELETE FROM WavyAggregatorMapping
-            WHERE WavyID IN (SELECT WavyID FROM Wavys WHERE LastSeen < @threshold)
-            OR AggregatorID IN (SELECT AggregatorID FROM Aggregators WHERE LastSeen < @threshold)";
+    DELETE FROM WavyAggregatorMapping
+    WHERE WavyID IN (SELECT WavyID FROM Wavys WHERE LastSeen < @threshold)
+    OR AggregatorID IN (SELECT AggregatorID FROM Aggregators WHERE LastSeen < @threshold)";
 			using (var cmd = new SqlCommand(deleteMappings, connection, transaction))
 			{
 				cmd.Parameters.AddWithValue("@threshold", threshold);
@@ -438,16 +708,6 @@ namespace OceanMonitorSystem
 				int removedAggregators = cmd.ExecuteNonQuery();
 				Console.WriteLine($"Removed {removedAggregators} inactive Aggregator devices");
 			}
-		}
-
-		/// <summary>
-		/// Clears the console screen and displays the menu again
-		/// </summary>
-		static void ClearScreenAndShowMenu()
-		{
-			Console.Clear();
-			Console.WriteLine($"[SERVER] Listening on port {PORT}...");
-			DisplayCommandMenu();
 		}
 
 		#endregion
@@ -479,7 +739,7 @@ namespace OceanMonitorSystem
 							break;
 
 						int code = BitConverter.ToInt32(buffer, 0);
-						Console.WriteLine($"[SERVER] Received message with code: {code} from {clientIp}");
+						Log($"Received message with code: {code} from {clientIp}");
 
 						switch (code)
 						{
@@ -499,7 +759,7 @@ namespace OceanMonitorSystem
 								break;
 
 							default:
-								Console.WriteLine($"[WARNING] Unknown message code: {code} from {clientIp}");
+								Log($"[WARNING] Unknown message code: {code} from {clientIp}");
 								break;
 						}
 
@@ -510,11 +770,11 @@ namespace OceanMonitorSystem
 				}
 
 				client.Close();
-				Console.WriteLine($"[SERVER] Connection closed with {(aggregatorId != "Unknown" ? "Aggregator " + aggregatorId : clientIp)}");
+				Log($"Connection closed with {(aggregatorId != "Unknown" ? "Aggregator " + aggregatorId : clientIp)}");
 			}
 			catch (Exception ex)
 			{
-				Console.WriteLine($"[ERROR] {ex.Message} from {(aggregatorId != "Unknown" ? "Aggregator " + aggregatorId : clientIp)}");
+				Log($"[ERROR] {ex.Message} from {(aggregatorId != "Unknown" ? "Aggregator " + aggregatorId : clientIp)}");
 
 				if (aggregatorId != "Unknown")
 				{
@@ -540,7 +800,7 @@ namespace OceanMonitorSystem
 				connectedAggregators[aggregatorId] = DateTime.Now;
 			}
 
-			Console.WriteLine($"[102] Connection established with Aggregator {aggregatorId} from {clientIp}");
+			Log($"[102] Connection established with Aggregator {aggregatorId} from {clientIp}");
 			SendConfirmation(stream, MessageCodes.ServerConfirmation);
 
 			return aggregatorId;
@@ -562,7 +822,7 @@ namespace OceanMonitorSystem
 					connectedAggregators.Remove(aggregatorId);
 			}
 
-			Console.WriteLine($"[502] Disconnection request from Aggregator {aggregatorId}");
+			Log($"[502] Disconnection request from Aggregator {aggregatorId}");
 			SendConfirmation(stream, MessageCodes.ServerConfirmation);
 		}
 
@@ -572,11 +832,11 @@ namespace OceanMonitorSystem
 		static void ProcessData(byte[] buffer, int bytesRead, NetworkStream stream, int code, ref string aggregatorId)
 		{
 			string jsonData = Encoding.UTF8.GetString(buffer, 4, bytesRead - 4);
-			Console.WriteLine($"[{code}] Data received from {(aggregatorId != "Unknown" ? "Aggregator " + aggregatorId : "unknown aggregator")}");
+			Log($"[{code}] Data received from {(aggregatorId != "Unknown" ? "Aggregator " + aggregatorId : "unknown aggregator")}");
 
 			if (verboseMode)
 			{
-				Console.WriteLine($"[DATA] {jsonData}");
+				Log($"[DATA] {jsonData}", true);
 			}
 
 			try
@@ -589,15 +849,15 @@ namespace OceanMonitorSystem
 
 					SaveToDatabase(data);
 					SendConfirmation(stream, MessageCodes.ServerConfirmation);
-					Console.WriteLine($"[402] Confirmation sent to Aggregator {aggregatorId}");
+					Log($"[402] Confirmation sent to Aggregator {aggregatorId}");
 				}
 			}
 			catch (Exception ex)
 			{
-				Console.WriteLine($"[ERROR] Failed to process data: {ex.Message}");
+				Log($"[ERROR] Failed to process data: {ex.Message}");
 				if (verboseMode && ex.InnerException != null)
 				{
-					Console.WriteLine($"[ERROR] Inner exception: {ex.InnerException.Message}");
+					Log($"[ERROR] Inner exception: {ex.InnerException.Message}", true);
 				}
 			}
 		}
@@ -614,7 +874,7 @@ namespace OceanMonitorSystem
 			}
 			catch (Exception ex)
 			{
-				Console.WriteLine($"[ERROR] Failed to send confirmation: {ex.Message}");
+				Log($"[ERROR] Failed to send confirmation: {ex.Message}");
 			}
 		}
 
@@ -938,6 +1198,180 @@ namespace OceanMonitorSystem
 
 		#region gRPC Operations
 
+		private static void StartPythonGrpcServer()
+		{
+			try
+			{
+				inMenuMode = true;
+
+				if (PythonServerProcess != null && !PythonServerProcess.HasExited)
+				{
+					AnsiConsole.MarkupLine("[yellow]Python gRPC server is already running.[/]");
+					return;
+				}
+
+				// Check if cargo is available
+				bool cargoExists = false;
+				try
+				{
+					using var testProcess = Process.Start(new ProcessStartInfo
+					{
+						FileName = "python",
+						Arguments = "--version",
+						UseShellExecute = false,
+						RedirectStandardOutput = true,
+						RedirectStandardError = true,
+						CreateNoWindow = true
+					});
+
+					if (testProcess != null)
+					{
+						testProcess.WaitForExit();
+						cargoExists = testProcess.ExitCode == 0;
+					}
+				}
+				catch
+				{
+					cargoExists = false;
+				}
+
+				if (!cargoExists)
+				{
+					AnsiConsole.MarkupLine("[yellow]Please install Python from https://www.python.org/");
+					return;
+				}
+
+				// Use the current Aggregator directory or try to find the directory containing grpc_calc_server.py
+				string projectDir = Directory.GetCurrentDirectory();
+
+				// If there's no grpc_calc_server.py in the current directory, check if we're in the bin folder
+				if (!File.Exists(Path.Combine(projectDir, "grpc_calc_server.py")))
+				{
+					// Try the directory specified in the comment
+					projectDir = Path.GetFullPath("C:\\code\\SD\\SD_2025-TP\\TP2\\Server");
+
+					if (!Directory.Exists(projectDir))
+					{
+						AnsiConsole.MarkupLine("[red]Could not find the Python project directory.[/]");
+						return;
+					}
+				}
+
+				AnsiConsole.Status()
+					.Start("Starting Python gRPC validation server...", ctx =>
+					{
+						ctx.Spinner(Spinner.Known.Dots);
+						ctx.SpinnerStyle(Style.Parse("green"));
+
+						Log($"Running python in directory: {projectDir}");
+
+						// Start the server using cargo run
+						var startInfo = new ProcessStartInfo
+						{
+							FileName = "python",
+							Arguments = "grpc_calc_server.py",
+							UseShellExecute = true, 
+							CreateNoWindow = false,
+							WindowStyle = ProcessWindowStyle.Normal,
+							WorkingDirectory = projectDir
+						};
+
+						PythonServerProcess = Process.Start(startInfo);
+
+						if (PythonServerProcess != null)
+						{
+							Log($"Python gRPC server started with process ID: {PythonServerProcess.Id}");
+							Thread.Sleep(2000); // Give cargo some time to start
+						}
+						else
+						{
+							Log("Failed to start Python gRPC server");
+						}
+					});
+
+				if (PythonServerProcess != null && !PythonServerProcess.HasExited)
+				{
+					AnsiConsole.MarkupLine("[green]Python gRPC validation server started successfully.[/]");
+				}
+				else
+				{
+					AnsiConsole.MarkupLine("[red]Failed to start Python gRPC validation server.[/]");
+				}
+			}
+			catch (Exception ex)
+			{
+				AnsiConsole.MarkupLine($"[red]Error starting Python gRPC server: {ex.Message}[/]");
+			}
+			finally
+			{
+				inMenuMode = false;
+			}
+		}
+
+		/// <summary>
+		/// Kills the running Python gRPC calculation server
+		/// </summary>
+		static void KillPythonGrpcServer()
+		{
+			try
+			{
+				inMenuMode = true;
+
+				if (PythonServerProcess == null || PythonServerProcess.HasExited)
+				{
+					AnsiConsole.MarkupLine("[yellow]No Python gRPC server is currently running.[/]");
+					return;
+				}
+
+				AnsiConsole.Status()
+					.Start("Stopping Python gRPC calculation server...", ctx =>
+					{
+						ctx.Spinner(Spinner.Known.Dots);
+						ctx.SpinnerStyle(Style.Parse("red"));
+
+						try
+						{
+							if (!PythonServerProcess.HasExited)
+							{
+								PythonServerProcess.Kill(true); // Force kill
+								PythonServerProcess.WaitForExit(3000); // Wait up to 3 seconds
+
+								if (PythonServerProcess.HasExited)
+								{
+									Log("Successfully stopped Python gRPC server");
+								}
+								else
+								{
+									Log("Failed to stop Python gRPC server");
+								}
+							}
+						}
+						catch (Exception ex)
+						{
+							Log($"Error while stopping Python gRPC server: {ex.Message}");
+						}
+					});
+
+				if (PythonServerProcess.HasExited)
+				{
+					AnsiConsole.MarkupLine("[green]Python gRPC calculation server stopped successfully.[/]");
+					PythonServerProcess = null;
+				}
+				else
+				{
+					AnsiConsole.MarkupLine("[red]Failed to stop Python gRPC calculation server.[/]");
+				}
+			}
+			catch (Exception ex)
+			{
+				AnsiConsole.MarkupLine($"[red]Error stopping Python gRPC server: {ex.Message}[/]");
+			}
+			finally
+			{
+				inMenuMode = false;
+			}
+		}
+
 		/// <summary>
 		/// Sends measurement data to Python server for calculation and stores the results
 		/// </summary>
@@ -946,7 +1380,9 @@ namespace OceanMonitorSystem
 		{
 			try
 			{
-				Console.WriteLine($"[GRPC] Sending data to calculation server: WavyID={wavyId}, Type={dataType}, Value={value}");
+				// Don't show output during menu mode
+				if (!inMenuMode)
+					Log($"[GRPC] Sending data to calculation server: WavyID={wavyId}, Type={dataType}, Value={value}");
 
 				var calculationRequest = new DataCalculationRequest
 				{
@@ -961,7 +1397,8 @@ namespace OceanMonitorSystem
 
 				if (response != null)
 				{
-					Console.WriteLine($"[GRPC] Received calculation results for {wavyId}");
+					if (!inMenuMode)
+						Log($"[GRPC] Received calculation results for {wavyId}");
 
 					// Store both original measurement and calculated metrics
 					InsertMeasurement(connection, transaction, wavyId, aggregatorId, dataType, value, timestamp);
@@ -976,7 +1413,9 @@ namespace OceanMonitorSystem
 			}
 			catch (Exception ex)
 			{
-				Console.WriteLine($"[ERROR] gRPC calculation failed: {ex.Message}");
+				if (!inMenuMode)
+					Log($"[ERROR] gRPC calculation failed: {ex.Message}");
+
 				// Fall back to normal insertion without calculated metrics
 				InsertMeasurement(connection, transaction, wavyId, aggregatorId, dataType, value, timestamp);
 				return false;
@@ -993,11 +1432,11 @@ namespace OceanMonitorSystem
 			DateTime timestamp = DateTimeOffset.FromUnixTimeMilliseconds(metrics.Timestamp).DateTime;
 
 			string insertMetrics = @"
-        INSERT INTO CalculatedMetrics 
-        (WavyID, AggregatorID, DataType, OriginalValue, AverageValue, Variance, 
-        TrendCoefficient, NormalizedValue, AnomalyScore, Timestamp)
-        VALUES 
-        (@wid, @aid, @type, @orig, @avg, @var, @trend, @norm, @anom, @ts)";
+INSERT INTO CalculatedMetrics 
+(WavyID, AggregatorID, DataType, OriginalValue, AverageValue, Variance, 
+TrendCoefficient, NormalizedValue, AnomalyScore, Timestamp)
+VALUES 
+(@wid, @aid, @type, @orig, @avg, @var, @trend, @norm, @anom, @ts)";
 
 			using (var cmd = new SqlCommand(insertMetrics, connection, transaction))
 			{
@@ -1014,10 +1453,10 @@ namespace OceanMonitorSystem
 				cmd.ExecuteNonQuery();
 			}
 
-			if (verboseMode)
+			if (verboseMode && !inMenuMode)
 			{
-				Console.WriteLine($"[DB] Calculated metrics saved: WavyID={metrics.WavyId}, Type={metrics.DataType}");
-				Console.WriteLine($"     Average={metrics.AverageValue:F2}, Variance={metrics.Variance:F2}, Anomaly={metrics.AnomalyScore:F2}");
+				Log($"[DB] Calculated metrics saved: WavyID={metrics.WavyId}, Type={metrics.DataType}", true);
+				Log($"     Average={metrics.AverageValue:F2}, Variance={metrics.Variance:F2}, Anomaly={metrics.AnomalyScore:F2}", true);
 			}
 		}
 

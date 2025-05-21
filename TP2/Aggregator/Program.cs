@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -11,6 +12,7 @@ using System.Text.Json;
 using System.Threading;
 using NetMQ;
 using NetMQ.Sockets;
+using Spectre.Console;
 
 /// <summary>
 /// Middle-tier component of the OceanMonitor system that collects data from Wavy clients 
@@ -49,6 +51,8 @@ class Aggregator
 		public static readonly string VALIDATION_SERVER_ADDRESS = "http://localhost:50052";
 		public static DataValidationClient _validationClient = null!;
 
+
+		// Then modify the ValidateAndCleanDataAsync method to respect this flag
 		// Timeouts and intervals
 		public static int ConfirmationTimeoutMs { get; private set; } = 10000;
 		public static int DataTransmissionIntervalSec { get; private set; } = 30;
@@ -249,6 +253,85 @@ class Aggregator
 
 	#endregion
 
+	#region Logging System
+
+	// Log queue to store messages that will be displayed when not in menu mode
+	private static readonly ConcurrentQueue<string> logMessages = new ConcurrentQueue<string>();
+	private static bool inMenuMode = false;
+	private static Thread? logDisplayThread = null;
+	private static Process? grpcServerProcess = null;
+
+	/// <summary>
+	/// Logs a message to the message queue instead of directly to console
+	/// </summary>
+	private static void Log(string message, bool isVerbose = false)
+	{
+		if (isVerbose && !verboseMode)
+			return;
+
+		string formattedMessage = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
+		logMessages.Enqueue(formattedMessage);
+
+		// Only display immediately if not in menu mode and log display thread isn't active
+		if (!inMenuMode && logDisplayThread == null)
+		{
+			AnsiConsole.MarkupLine($"[gray]{EscapeMarkup(formattedMessage)}[/]");
+		}
+	}
+
+	/// <summary>
+	/// Escapes markup characters in a string for Spectre.Console
+	/// </summary>
+	private static string EscapeMarkup(string text)
+	{
+		return text.Replace("[", "[[").Replace("]", "]]");
+	}
+
+	/// <summary>
+	/// Starts the log display thread that shows logs when not in menu mode
+	/// </summary>
+	private static void StartLogDisplayThread()
+	{
+		if (logDisplayThread != null)
+			return;
+
+		logDisplayThread = new Thread(() =>
+		{
+			try
+			{
+				while (isRunning)
+				{
+					if (!inMenuMode && logMessages.TryDequeue(out string? message))
+					{
+						// Use AnsiConsole for richer formatting
+						AnsiConsole.MarkupLine($"[gray]{EscapeMarkup(message)}[/]");
+					}
+					else
+					{
+						Thread.Sleep(100);
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				AnsiConsole.MarkupLine($"[red]Error in log display thread: {ex.Message}[/]");
+			}
+			finally
+			{
+				UnregisterThread(Thread.CurrentThread);
+			}
+		})
+		{
+			IsBackground = true,
+			Name = "LogDisplayThread"
+		};
+
+		RegisterThread(logDisplayThread);
+		logDisplayThread.Start();
+	}
+
+	#endregion
+
 	#region Entry Point and Main Thread Management
 
 	/// <summary>
@@ -258,10 +341,20 @@ class Aggregator
 	{
 		AppDomain.CurrentDomain.ProcessExit += (sender, e) => OnProcessExit(sender!, e);
 
-		Console.WriteLine($"Aggregator {aggregatorId} starting...");
-		Console.WriteLine($"Receiving data via ZeroMQ, sending to {Config.ServerIp}:{Config.ServerPort}");
-		DisplayCommandMenu();
+		// Clear the console and show a nice splash screen
+		AnsiConsole.Clear();
+		AnsiConsole.Write(
+			new FigletText("Aggregator")
+				.Color(Color.Aqua)
+				.Centered());
 
+		AnsiConsole.Write(new Rule("[blue]Ocean Monitor System[/]").RuleStyle("grey").Centered());
+
+		AnsiConsole.MarkupLine($"[bold aqua]Aggregator[/] [yellow]{aggregatorId}[/] [bold green]starting...[/]");
+		AnsiConsole.MarkupLine($"Receiving data via [blue]ZeroMQ[/], sending to [green]{Config.ServerIp}:{Config.ServerPort}[/]");
+
+		StartLogDisplayThread();
+		DisplayCommandMenu();
 		InitializeThreads();
 
 		// Keep main thread alive until shutdown
@@ -274,19 +367,28 @@ class Aggregator
 	}
 
 	/// <summary>
-	/// Displays available commands in the console
+	/// Displays available commands in the console using Spectre.Console
 	/// </summary>
 	private static void DisplayCommandMenu()
 	{
-		Console.WriteLine("\nAvailable Commands:");
-		Console.WriteLine("Press 'V' to toggle verbose mode");
-		Console.WriteLine("Press 'D' to show current data store");
-		Console.WriteLine("Press 'T' to show active threads");
-		Console.WriteLine("Press 'M' to manage subscriptions");
-		Console.WriteLine("Press 'S' to save current configuration");
-		Console.WriteLine("Press 'X' to delete configuration and subscription files");
-		Console.WriteLine("Press 'W' to clear screen");
-		Console.WriteLine("Press 'Q' to quit");
+		var table = new Table()
+			.BorderColor(Color.Grey)
+			.Title("[yellow]Available Commands[/]")
+			.AddColumn(new TableColumn("[aqua]Key[/]").Centered())
+			.AddColumn(new TableColumn("[green]Action[/]"));
+
+		table.AddRow("[yellow]V[/]", "Toggle verbose mode");
+		table.AddRow("[yellow]D[/]", "Show current data store");
+		table.AddRow("[yellow]T[/]", "Show active threads");
+		table.AddRow("[yellow]M[/]", "Manage subscriptions");
+		table.AddRow("[yellow]S[/]", "Save current configuration");
+		table.AddRow("[yellow]X[/]", "Delete configuration and subscription files");
+		table.AddRow("[yellow]R[/]", "Run Rust gRPC validation server");
+		table.AddRow("[yellow]K[/]", "Kill Rust gRPC validation server");
+		table.AddRow("[yellow]W[/]", "Clear screen");
+		table.AddRow("[yellow]Q[/]", "Quit");
+
+		AnsiConsole.Write(table);
 	}
 
 	/// <summary>
@@ -314,7 +416,21 @@ class Aggregator
 	private static void OnProcessExit(object sender, EventArgs e)
 	{
 		isRunning = false;
-		Console.WriteLine("Process terminating, shutting down threads...");
+		Log("Process terminating, shutting down threads...");
+
+		// Kill the Rust server if it's running
+		if (grpcServerProcess != null && !grpcServerProcess.HasExited)
+		{
+			try
+			{
+				grpcServerProcess.Kill(true);
+			}
+			catch (Exception ex)
+			{
+				Log($"Error shutting down Rust gRPC server: {ex.Message}");
+			}
+		}
+
 		ShutdownThreads();
 	}
 
@@ -324,7 +440,21 @@ class Aggregator
 	private static void ShutdownThreads()
 	{
 		isRunning = false;
-		Console.WriteLine("Shutting down threads...");
+		Log("Shutting down threads...");
+
+		// Kill the Rust server if it's running
+		if (grpcServerProcess != null && !grpcServerProcess.HasExited)
+		{
+			try
+			{
+				Log("Terminating Rust gRPC server...");
+				grpcServerProcess.Kill(true);
+			}
+			catch (Exception ex)
+			{
+				Log($"Error shutting down Rust gRPC server: {ex.Message}");
+			}
+		}
 
 		WaitForThreadsToTerminate();
 		SendFinalServerDisconnection();
@@ -333,7 +463,7 @@ class Aggregator
 		PubSubConfig.Cleanup();
 		NetMQConfig.Cleanup();
 
-		Console.WriteLine("Shutdown complete.");
+		Log("Shutdown complete.");
 	}
 
 	/// <summary>
@@ -346,10 +476,10 @@ class Aggregator
 			Thread thread = threadEntry.Key;
 			if (thread != Thread.CurrentThread && thread.IsAlive)
 			{
-				Console.WriteLine($"Waiting for thread '{thread.Name}' to terminate...");
-				if (!thread.Join(2000))
+				Log($"Waiting for thread '{thread.Name}' to terminate...");
+				if (!thread.Join(2000)) // Wait up to 2 seconds
 				{
-					Console.WriteLine($"Thread '{thread.Name}' did not terminate gracefully.");
+					Log($"Thread '{thread.Name}' did not terminate gracefully.");
 				}
 			}
 		}
@@ -431,7 +561,7 @@ class Aggregator
 		{
 			case ConsoleKey.V:
 				verboseMode = !verboseMode;
-				Console.WriteLine($"Verbose mode: {(verboseMode ? "ON" : "OFF")}");
+				AnsiConsole.MarkupLine($"Verbose mode: {(verboseMode ? "[green]ON[/]" : "[grey]OFF[/]")}");
 				break;
 			case ConsoleKey.D:
 				ShowDataStore();
@@ -440,16 +570,22 @@ class Aggregator
 				ShowActiveThreads();
 				break;
 			case ConsoleKey.S:
-				Config.SaveToFile();
+				SaveConfigWithStatus();
 				break;
 			case ConsoleKey.X:
-				Config.DeleteConfigFile();
+				DeleteConfigWithStatus();
 				break;
 			case ConsoleKey.M:
 				ManageSubscriptions();
 				break;
+			case ConsoleKey.R:
+				StartRustGrpcServer();
+				break;
+			case ConsoleKey.K:
+				KillRustGrpcServer();
+				break;
 			case ConsoleKey.Q:
-				Console.WriteLine("Shutting down aggregator...");
+				AnsiConsole.MarkupLine("[yellow]Shutting down aggregator...[/]");
 				isRunning = false;
 				Thread.Sleep(500); // Give time for message to display
 				Environment.Exit(0);
@@ -465,40 +601,74 @@ class Aggregator
 	/// </summary>
 	private static void ManageSubscriptions()
 	{
-		Console.WriteLine("\n=== Subscription Management ===");
-		Console.WriteLine("Currently subscribed data types:");
-
-		int index = 1;
-		var dataTypes = new Dictionary<int, string>();
-
-		foreach (var dataType in PubSubConfig.SubscribedDataTypes)
+		try
 		{
-			Console.WriteLine($"{index}. {dataType}");
-			dataTypes[index++] = dataType;
+			inMenuMode = true;
+
+			// Clear the screen to focus on the menu
+			AnsiConsole.Clear();
+			AnsiConsole.Write(new Rule("[yellow]Subscription Management[/]").RuleStyle("blue").Centered());
+
+			var panel = new Panel("").Expand();
+			AnsiConsole.MarkupLine("[bold]Currently subscribed data types:[/]");
+
+			int index = 1;
+			var dataTypes = new Dictionary<int, string>();
+
+			var subscriptionTable = new Table().BorderColor(Color.Blue)
+				.AddColumn(new TableColumn("Index").Centered())
+				.AddColumn("Data Type");
+
+			foreach (var dataType in PubSubConfig.SubscribedDataTypes)
+			{
+				subscriptionTable.AddRow($"[yellow]{index}[/]", $"[green]{dataType}[/]");
+				dataTypes[index++] = dataType;
+			}
+
+			if (dataTypes.Count > 0)
+				AnsiConsole.Write(subscriptionTable);
+			else
+				AnsiConsole.MarkupLine("[grey]No active subscriptions[/]");
+
+			AnsiConsole.WriteLine();
+			AnsiConsole.MarkupLine("[bold]Available actions:[/]");
+			AnsiConsole.MarkupLine("[yellow]A[/]. Add a subscription");
+			AnsiConsole.MarkupLine("[yellow]R[/]. Remove a subscription");
+			AnsiConsole.MarkupLine("[yellow]B[/]. Back to main menu");
+
+			AnsiConsole.Markup("\n[bold]Enter your choice:[/] ");
+			var key = Console.ReadKey().KeyChar;
+			AnsiConsole.WriteLine();
+
+			switch (char.ToUpper(key))
+			{
+				case 'A':
+					AddSubscription();
+					break;
+				case 'R':
+					if (dataTypes.Count > 0)
+						RemoveSubscription(dataTypes);
+					else
+						AnsiConsole.MarkupLine("[yellow]No subscriptions to remove[/]");
+					break;
+				case 'B':
+					ClearScreenAndShowMenu();
+					return;
+			}
+
+			AnsiConsole.WriteLine();
+			AnsiConsole.Write(new Rule().RuleStyle("grey"));
+			AnsiConsole.WriteLine();
+
+			// Allow user to see the result before returning to main menu
+			AnsiConsole.Markup("[yellow]Press any key to return to main menu...[/]");
+			Console.ReadKey(true);
+			ClearScreenAndShowMenu();
 		}
-
-		Console.WriteLine("\nAvailable actions:");
-		Console.WriteLine("A. Add a subscription");
-		Console.WriteLine("R. Remove a subscription");
-		Console.WriteLine("B. Back to main menu");
-
-		Console.Write("\nEnter your choice: ");
-		var key = Console.ReadKey().KeyChar;
-		Console.WriteLine();
-
-		switch (char.ToUpper(key))
+		finally
 		{
-			case 'A':
-				AddSubscription();
-				break;
-			case 'R':
-				RemoveSubscription(dataTypes);
-				break;
-			case 'B':
-				return;
+			inMenuMode = false;
 		}
-
-		Console.WriteLine("===========================\n");
 	}
 
 	/// <summary>
@@ -509,47 +679,44 @@ class Aggregator
 		// List of valid data types that can be subscribed to
 		var validDataTypes = new List<string> { "Temperature", "WindSpeed", "Frequency", "Decibels" };
 
-		Console.WriteLine("\nAvailable data types:");
-		for (int i = 0; i < validDataTypes.Count; i++)
-		{
-			Console.WriteLine($"{i + 1}. {validDataTypes[i]}");
-		}
+		AnsiConsole.Clear();
+		AnsiConsole.Write(new Rule("[yellow]Add Subscription[/]").RuleStyle("blue").Centered());
 
-		Console.WriteLine("\nEnter data type number or name to subscribe to:");
-		string input = Console.ReadLine()?.Trim() ?? "";
-
-		string? selectedDataType = null;
-
-		// Check if input is a number (index)
-		if (int.TryParse(input, out int index) && index >= 1 && index <= validDataTypes.Count)
-		{
-			selectedDataType = validDataTypes[index - 1];
-		}
-		// Otherwise check if input matches a valid type name
-		else
-		{
-			selectedDataType = validDataTypes.FirstOrDefault(dt =>
-				dt.Equals(input, StringComparison.OrdinalIgnoreCase));
-		}
-
-		if (selectedDataType == null)
-		{
-			Console.WriteLine("Invalid data type. Please select from the available options.");
-			return;
-		}
+		// Create a selection menu using Spectre.Console
+		var dataType = AnsiConsole.Prompt(
+			new SelectionPrompt<string>()
+				.Title("[green]Choose a data type to subscribe to:[/]")
+				.PageSize(10)
+				.HighlightStyle(new Style(foreground: Color.Yellow))
+				.AddChoices(validDataTypes)
+		);
 
 		// Check if already subscribed
-		if (PubSubConfig.SubscribedDataTypes.Contains(selectedDataType))
+		if (PubSubConfig.SubscribedDataTypes.Contains(dataType))
 		{
-			Console.WriteLine($"Already subscribed to {selectedDataType} data.");
+			AnsiConsole.MarkupLine($"[yellow]Already subscribed to {dataType} data.[/]");
 			return;
 		}
 
-		// Proceed with subscription
-		if (PubSubConfig.Subscribe(selectedDataType))
-		{
-			Console.WriteLine($"Successfully subscribed to {selectedDataType} data.");
-		}
+		// Show a spinner while subscribing
+		AnsiConsole.Status()
+			.Start($"Subscribing to {dataType}...", ctx =>
+			{
+				ctx.Spinner(Spinner.Known.Dots);
+				ctx.SpinnerStyle(Style.Parse("yellow"));
+
+				// Proceed with subscription
+				if (PubSubConfig.Subscribe(dataType))
+				{
+					AnsiConsole.MarkupLine($"[green]Successfully subscribed to {dataType} data.[/]");
+				}
+				else
+				{
+					AnsiConsole.MarkupLine($"[red]Failed to subscribe to {dataType} data.[/]");
+				}
+
+				Thread.Sleep(1000); // Pause to show the result
+			});
 	}
 
 	/// <summary>
@@ -557,19 +724,41 @@ class Aggregator
 	/// </summary>
 	private static void RemoveSubscription(Dictionary<int, string> dataTypes)
 	{
-		Console.WriteLine("\nEnter number of subscription to remove:");
+		AnsiConsole.Clear();
+		AnsiConsole.Write(new Rule("[yellow]Remove Subscription[/]").RuleStyle("blue").Centered());
 
-		if (int.TryParse(Console.ReadLine() ?? "", out int choice) && dataTypes.TryGetValue(choice, out string dataType))
-		{
-			if (PubSubConfig.Unsubscribe(dataType))
+		// Create list of available subscriptions for selection
+		var choices = dataTypes.Select(kvp => $"{kvp.Key}: {kvp.Value}").ToList();
+
+		var selection = AnsiConsole.Prompt(
+			new SelectionPrompt<string>()
+				.Title("[green]Select subscription to remove:[/]")
+				.PageSize(10)
+				.HighlightStyle(new Style(foreground: Color.Yellow))
+				.AddChoices(choices)
+		);
+
+		int key = int.Parse(selection.Split(':')[0]);
+		string dataType = dataTypes[key];
+
+		// Show a spinner while unsubscribing
+		AnsiConsole.Status()
+			.Start($"Unsubscribing from {dataType}...", ctx =>
 			{
-				Console.WriteLine($"Successfully unsubscribed from {dataType} data.");
-			}
-		}
-		else
-		{
-			Console.WriteLine("Invalid selection.");
-		}
+				ctx.Spinner(Spinner.Known.Dots);
+				ctx.SpinnerStyle(Style.Parse("yellow"));
+
+				if (PubSubConfig.Unsubscribe(dataType))
+				{
+					AnsiConsole.MarkupLine($"[green]Successfully unsubscribed from {dataType} data.[/]");
+				}
+				else
+				{
+					AnsiConsole.MarkupLine($"[red]Failed to unsubscribe from {dataType} data.[/]");
+				}
+
+				Thread.Sleep(1000); // Pause to show the result
+			});
 	}
 
 	/// <summary>
@@ -577,41 +766,147 @@ class Aggregator
 	/// </summary>
 	private static void ShowDataStore()
 	{
-		Console.WriteLine("\n=== Current Data Store ===");
-		if (dataStore.IsEmpty)
+		try
 		{
-			Console.WriteLine("Data store is empty.");
-		}
-		else
-		{
-			foreach (var dataType in dataStore.Keys)
-			{
-				var dataList = dataStore[dataType];
-				Console.WriteLine($"Data Type: {dataType}, Records: {dataList.Count}");
+			inMenuMode = true;
+			AnsiConsole.Clear();
 
-				if (verboseMode && dataList.Count > 0)
+			AnsiConsole.Write(new Rule("[yellow]Current Data Store[/]").RuleStyle("blue").Centered());
+
+			if (dataStore.IsEmpty)
+			{
+				AnsiConsole.MarkupLine("[grey]Data store is empty.[/]");
+			}
+			else
+			{
+				var table = new Table()
+					.BorderColor(Color.Blue)
+					.AddColumn(new TableColumn("[green]Data Type[/]"))
+					.AddColumn(new TableColumn("[green]Records[/]").Centered());
+
+				foreach (var dataType in dataStore.Keys)
 				{
-					DisplayDataSample(dataList);
+					var dataList = dataStore[dataType];
+					table.AddRow($"[yellow]{dataType}[/]", $"[aqua]{dataList.Count}[/]");
+				}
+
+				AnsiConsole.Write(table);
+
+				// If in verbose mode, show the actual data samples in expandable panels
+				if (verboseMode)
+				{
+					AnsiConsole.WriteLine();
+					AnsiConsole.Write(new Rule("[yellow]Data Samples[/]").RuleStyle("grey"));
+
+					foreach (var dataType in dataStore.Keys)
+					{
+						var dataList = dataStore[dataType];
+						if (dataList.Count > 0)
+						{
+							var panel = new Panel(GetDataSampleText(dataList))
+								.Header($"[blue]{dataType} Samples[/]")
+								.BorderColor(Color.Grey)
+								.Expand();
+
+							AnsiConsole.Write(panel);
+						}
+					}
 				}
 			}
+
+			AnsiConsole.WriteLine();
+			AnsiConsole.Markup("[yellow]Press any key to return to main menu...[/]");
+			Console.ReadKey(true);
+			ClearScreenAndShowMenu();
 		}
-		Console.WriteLine("=======================\n");
+		finally
+		{
+			inMenuMode = false;
+		}
 	}
 
 	/// <summary>
-	/// Displays a sample of data items (up to 5) from a collection
+	/// Gets a formatted text sample of data items
 	/// </summary>
-	/// <param name="dataList">The collection of data items to sample</param>
-	private static void DisplayDataSample(ConcurrentBag<string> dataList)
+	private static string GetDataSampleText(ConcurrentBag<string> dataList)
 	{
+		var sb = new StringBuilder();
+
 		int i = 0;
 		foreach (var dataItem in dataList.Take(5)) // Show at most 5 items per type to avoid flooding
 		{
-			Console.WriteLine($"  - Item {++i}: {dataItem}");
+			sb.AppendLine($"  - Item {++i}: {dataItem}");
 		}
+
 		if (dataList.Count > 5)
 		{
-			Console.WriteLine($"  ... and {dataList.Count - 5} more items");
+			sb.AppendLine($"  ... and {dataList.Count - 5} more items");
+		}
+
+		return sb.ToString();
+	}
+
+	/// <summary>
+	/// Saves configuration with visual feedback
+	/// </summary>
+	private static void SaveConfigWithStatus()
+	{
+		try
+		{
+			inMenuMode = true;
+			AnsiConsole.Status()
+				.Start("Saving configuration...", ctx =>
+				{
+					ctx.Spinner(Spinner.Known.Dots);
+					ctx.SpinnerStyle(Style.Parse("green"));
+
+					// Save config
+					Config.SaveToFile();
+
+					Thread.Sleep(1000); // Show status for a moment
+				});
+
+			AnsiConsole.MarkupLine("[green]Configuration saved successfully.[/]");
+		}
+		finally
+		{
+			inMenuMode = false;
+		}
+	}
+
+	/// <summary>
+	/// Deletes configuration with visual feedback
+	/// </summary>
+	private static void DeleteConfigWithStatus()
+	{
+		try
+		{
+			inMenuMode = true;
+
+			if (AnsiConsole.Confirm("Are you sure you want to delete the configuration files?", false))
+			{
+				AnsiConsole.Status()
+					.Start("Deleting configuration...", ctx =>
+					{
+						ctx.Spinner(Spinner.Known.Dots);
+						ctx.SpinnerStyle(Style.Parse("yellow"));
+
+						// Delete config
+						Config.DeleteConfigFile();
+
+						Thread.Sleep(1000); // Show status for a moment
+					});
+
+				AnsiConsole.MarkupLine("[green]Configuration files deleted. Default settings will be used on restart.[/]");
+			}
+			else
+			{
+				AnsiConsole.MarkupLine("[yellow]Operation canceled.[/]");
+			}
+		}
+		finally
+		{
+			inMenuMode = false;
 		}
 	}
 
@@ -620,25 +915,76 @@ class Aggregator
 	/// </summary>
 	private static void ShowActiveThreads()
 	{
-		Console.WriteLine("\n=== Active Threads ===");
-		if (activeThreads.IsEmpty)
+		try
 		{
-			Console.WriteLine("No active threads.");
-		}
-		else
-		{
-			foreach (var threadEntry in activeThreads)
-			{
-				Thread thread = threadEntry.Key;
-				DateTime startTime = threadEntry.Value;
-				TimeSpan runningFor = DateTime.Now - startTime;
+			inMenuMode = true;
+			AnsiConsole.Clear();
 
-				Console.WriteLine($"Thread: {thread.Name ?? "Unnamed"}");
-				Console.WriteLine($"  ID: {thread.ManagedThreadId}, State: {thread.ThreadState}");
-				Console.WriteLine($"  Running for: {runningFor.Hours}h {runningFor.Minutes}m {runningFor.Seconds}s");
+			AnsiConsole.Write(new Rule("[yellow]Active Threads[/]").RuleStyle("blue").Centered());
+
+			if (activeThreads.IsEmpty)
+			{
+				AnsiConsole.MarkupLine("[grey]No active threads.[/]");
 			}
+			else
+			{
+				var table = new Table()
+					.BorderColor(Color.Blue)
+					.AddColumn(new TableColumn("[green]Thread Name[/]"))
+					.AddColumn(new TableColumn("[green]ID[/]").Centered())
+					.AddColumn(new TableColumn("[green]State[/]"))
+					.AddColumn(new TableColumn("[green]Running Time[/]"));
+
+				foreach (var threadEntry in activeThreads)
+				{
+					Thread thread = threadEntry.Key;
+					DateTime startTime = threadEntry.Value;
+					TimeSpan runningFor = DateTime.Now - startTime;
+
+					string state = thread.IsAlive ? "[green]Active[/]" : "[grey]Inactive[/]";
+					string runtime = $"{runningFor.Hours}h {runningFor.Minutes}m {runningFor.Seconds}s";
+
+					table.AddRow(
+						$"[yellow]{thread.Name ?? "Unnamed"}[/]",
+						$"[aqua]{thread.ManagedThreadId}[/]",
+						state,
+						runtime);
+				}
+
+				AnsiConsole.Write(table);
+			}
+
+			// Add Rust server status info if applicable
+			if (grpcServerProcess != null)
+			{
+				AnsiConsole.WriteLine();
+				AnsiConsole.Write(new Rule("[yellow]External Processes[/]").RuleStyle("blue"));
+
+				bool isRunning = !grpcServerProcess.HasExited;
+				string status = isRunning ? "[green]Running[/]" : "[red]Exited[/]";
+
+				var processTable = new Table()
+					.BorderColor(Color.DarkBlue)
+					.AddColumn(new TableColumn("[green]Process[/]"))
+					.AddColumn(new TableColumn("[green]PID[/]").Centered())
+					.AddColumn(new TableColumn("[green]Status[/]"));
+
+				processTable.AddRow("[yellow]Rust gRPC Server[/]",
+					$"[aqua]{grpcServerProcess.Id}[/]",
+					status);
+
+				AnsiConsole.Write(processTable);
+			}
+
+			AnsiConsole.WriteLine();
+			AnsiConsole.Markup("[yellow]Press any key to return to main menu...[/]");
+			Console.ReadKey(true);
+			ClearScreenAndShowMenu();
 		}
-		Console.WriteLine("===================\n");
+		finally
+		{
+			inMenuMode = false;
+		}
 	}
 
 	/// <summary>
@@ -646,9 +992,33 @@ class Aggregator
 	/// </summary>
 	static void ClearScreenAndShowMenu()
 	{
-		Console.Clear();
-		Console.WriteLine($"Aggregator {aggregatorId} running...");
-		Console.WriteLine($"Receiving data via ZeroMQ, sending to {Config.ServerIp}:{Config.ServerPort}");
+		AnsiConsole.Clear();
+
+		AnsiConsole.Write(
+			new FigletText("Aggregator")
+				.Color(Color.Aqua)
+				.Centered());
+
+		AnsiConsole.Write(new Rule("[blue]Ocean Monitor System[/]").RuleStyle("grey").Centered());
+
+		var statusTable = new Table()
+			.Border(TableBorder.Rounded)
+			.BorderColor(Color.Grey)
+			.AddColumn(new TableColumn("[blue]Property[/]"))
+			.AddColumn(new TableColumn("[green]Value[/]"));
+
+		statusTable.AddRow("Aggregator ID", $"[yellow]{aggregatorId}[/]");
+		statusTable.AddRow("Server Connection", $"[yellow]{Config.ServerIp}:{Config.ServerPort}[/]");
+		statusTable.AddRow("Verbose Mode", verboseMode ? "[green]ON[/]" : "[grey]OFF[/]");
+		statusTable.AddRow("Subscriptions", $"[aqua]{PubSubConfig.SubscribedDataTypes.Count}[/] data types");
+		statusTable.AddRow("Rust gRPC Server",
+			grpcServerProcess != null && !grpcServerProcess.HasExited
+			? $"[green]Running (PID: {grpcServerProcess.Id})[/]"
+			: "[grey]Not running[/]");
+
+		AnsiConsole.Write(statusTable);
+		AnsiConsole.WriteLine();
+
 		DisplayCommandMenu();
 	}
 
@@ -665,7 +1035,7 @@ class Aggregator
 		{
 			while (isRunning)
 			{
-				Console.WriteLine($"Waiting for {Config.DataTransmissionIntervalSec} seconds before sending data...");
+				Log($"Waiting for {Config.DataTransmissionIntervalSec} seconds before sending data...");
 
 				// Wait for the next transmission window
 				for (int i = 0; i < Config.DataTransmissionIntervalSec && isRunning; i++)
@@ -675,14 +1045,14 @@ class Aggregator
 
 				if (!isRunning) break;
 
-				Console.WriteLine($"\n[{DateTime.Now:HH:mm:ss.fff}] Preparing to send aggregated data to server");
+				Log($"Preparing to send aggregated data to server");
 
 				// Capture current data for transmission and reset the store
 				var dataToSend = PrepareDataForTransmission();
 
 				if (dataToSend.IsEmpty)
 				{
-					Console.WriteLine("No data to send to server.");
+					Log("No data to send to server.");
 					continue;
 				}
 
@@ -692,7 +1062,7 @@ class Aggregator
 		}
 		catch (Exception ex)
 		{
-			Console.WriteLine($"Fatal error in data sender: {ex.Message}");
+			Log($"Fatal error in data sender: {ex.Message}");
 		}
 		finally
 		{
@@ -1142,7 +1512,6 @@ class Aggregator
 
 							try
 							{
-								// Just use the standard ReceiveFrameString without timeout
 								// The socket will use its default timeout behavior
 								string response = requestSocket.ReceiveFrameString();
 								Console.WriteLine($"Subscription response: {response}");
@@ -1321,10 +1690,81 @@ class Aggregator
 		}
 
 		/// <summary>
-		/// Processes data received from a subscription
+		/// Processes data received from a subscription with improved output control
 		/// </summary>
 		private static async void ProcessReceivedData(string dataType, Dictionary<string, object> data)
 		{
+			// Skip all output processing while in menu mode
+			if (inMenuMode)
+			{
+				// Store the data but don't display anything
+				try
+				{
+					// Extract data values silently
+					string wavyId = data.TryGetValue("WavyId", out var wavyIdObj) && wavyIdObj != null
+						? wavyIdObj.ToString() ?? "Unknown"
+						: "Unknown";
+
+					double value = 0.0;
+					if (data.TryGetValue("Value", out var valueObj) && valueObj != null)
+					{
+						if (valueObj is JsonElement jsonElement)
+						{
+							if (jsonElement.ValueKind == JsonValueKind.Number)
+								value = jsonElement.GetDouble();
+							else if (jsonElement.ValueKind == JsonValueKind.String &&
+									!string.IsNullOrEmpty(jsonElement.GetString()) &&
+									double.TryParse(jsonElement.GetString(), out double parsedValue))
+								value = parsedValue;
+						}
+						else
+						{
+							try { value = Convert.ToDouble(valueObj); }
+							catch { }
+						}
+					}
+
+					// Create validation data
+					var validationData = new { Data = new[] { new { DataType = dataType, Value = value } } };
+					string validationJson = JsonSerializer.Serialize(validationData);
+
+					// Send data for validation silently
+					var (isValid, _) = await Config._validationClient.ValidateAndCleanDataAsync(wavyId, validationJson);
+
+					if (isValid)
+					{
+						// Store valid data
+						var storeDataItem = new Dictionary<string, object>
+				{
+					{ "DataType", dataType },
+					{ "Value", value },
+					{ "WavyId", wavyId },
+					{ "Timestamp", DateTime.UtcNow }
+				};
+
+						string json = JsonSerializer.Serialize(storeDataItem);
+
+						// Store without logging
+						if (!dataStore.TryGetValue(dataType, out var container))
+						{
+							container = new ConcurrentBag<string>();
+							dataStore[dataType] = container;
+						}
+
+						container.Add(json);
+					}
+					// No output in either case while in menu mode
+				}
+				catch
+				{
+					// Suppress all exceptions in menu mode
+				}
+
+				// Early return to avoid any console output
+				return;
+			}
+
+			// Normal processing when not in menu mode
 			try
 			{
 				// Extract Wavy ID if present or use "Unknown"
@@ -1346,8 +1786,8 @@ class Aggregator
 							value = jsonElement.GetDouble();
 						}
 						else if (jsonElement.ValueKind == JsonValueKind.String &&
-								 !string.IsNullOrEmpty(jsonElement.GetString()) &&
-								 double.TryParse(jsonElement.GetString(), out double parsedValue))
+								!string.IsNullOrEmpty(jsonElement.GetString()) &&
+								double.TryParse(jsonElement.GetString(), out double parsedValue))
 						{
 							value = parsedValue;
 						}
@@ -1361,13 +1801,13 @@ class Aggregator
 						}
 						catch (Exception convEx)
 						{
-							Console.WriteLine($"Value conversion error: {convEx.Message}. Using default value 0.");
+							Log($"Value conversion error: {convEx.Message}. Using default value 0.");
 						}
 					}
 				}
 
-				// Debug output
-				Console.WriteLine($"Extracted value for {dataType}: {value} (from {wavyId})");
+				// Use Log instead of Console.WriteLine for controlled output
+				Log($"Extracted value for {dataType}: {value} (from {wavyId})", verboseMode);
 
 				// Create validation data format expected by the gRPC validation service
 				var validationData = new
@@ -1383,7 +1823,7 @@ class Aggregator
 				};
 
 				string validationJson = JsonSerializer.Serialize(validationData);
-				Console.WriteLine($"Validating data for {dataType}: {validationJson}");
+				Log($"Validating data for {dataType}: {validationJson}", verboseMode);
 
 				// Send data for validation
 				try
@@ -1392,15 +1832,15 @@ class Aggregator
 
 					if (!isValid)
 					{
-						Console.WriteLine($"[WARNING] Validation failed for {dataType} data from {wavyId}");
+						Log($"[WARNING] Validation failed for {dataType} data from {wavyId}");
 						if (verboseMode)
 						{
-							Console.WriteLine($"  Invalid data: {validationJson}");
+							Log($"  Invalid data: {validationJson}", true);
 						}
 						return; // Skip invalid data
 					}
 
-					Console.WriteLine($"Validation succeeded for {dataType} data from {wavyId}");
+					Log($"Validation succeeded for {dataType} data from {wavyId}", verboseMode);
 
 					// Create data to store - ensure proper structure with capitalized field names
 					var storeDataItem = new Dictionary<string, object>
@@ -1422,15 +1862,15 @@ class Aggregator
 
 					container.Add(json);
 
-					Console.WriteLine($"Stored {dataType} data point via ZeroMQ pub-sub with value {value}");
+					Log($"Stored {dataType} data point via ZeroMQ pub-sub with value {value}", verboseMode);
 					if (verboseMode)
 					{
-						Console.WriteLine($"  Stored data: {json}");
+						Log($"  Stored data: {json}", true);
 					}
 				}
 				catch (Exception valEx)
 				{
-					Console.WriteLine($"Data validation error: {valEx.Message}");
+					Log($"Data validation error: {valEx.Message}");
 
 					// Fall back to creating a simple data structure for storage without validation
 					var simpleDataItem = new Dictionary<string, object>
@@ -1453,19 +1893,19 @@ class Aggregator
 					// Store unvalidated data
 					container.Add(json);
 
-					Console.WriteLine($"Stored unvalidated {dataType} data point via ZeroMQ pub-sub with value {value}");
+					Log($"Stored unvalidated {dataType} data point via ZeroMQ pub-sub with value {value}", verboseMode);
 					if (verboseMode)
 					{
-						Console.WriteLine($"  Stored data: {json}");
+						Log($"  Stored data: {json}", true);
 					}
 				}
 			}
 			catch (Exception ex)
 			{
-				Console.WriteLine($"Error processing ZeroMQ data for {dataType}: {ex.Message}");
+				Log($"Error processing ZeroMQ data for {dataType}: {ex.Message}");
 				if (verboseMode)
 				{
-					Console.WriteLine($"Stack trace: {ex.StackTrace}");
+					Log($"Stack trace: {ex.StackTrace}", true);
 				}
 			}
 		}
@@ -1487,6 +1927,185 @@ class Aggregator
 	#endregion
 
 	#region Network Utilities
+
+	/// <summary>
+	/// Starts the Rust gRPC validation server using "cargo run"
+	/// </summary>
+	private static void StartRustGrpcServer()
+	{
+		try
+		{
+			inMenuMode = true;
+
+			if (grpcServerProcess != null && !grpcServerProcess.HasExited)
+			{
+				AnsiConsole.MarkupLine("[yellow]Rust gRPC server is already running.[/]");
+				return;
+			}
+
+			// Check if cargo is available
+			bool cargoExists = false;
+			try
+			{
+				using var testProcess = Process.Start(new ProcessStartInfo
+				{
+					FileName = "cargo",
+					Arguments = "--version",
+					UseShellExecute = false,
+					RedirectStandardOutput = true,
+					RedirectStandardError = true,
+					CreateNoWindow = true
+				});
+
+				if (testProcess != null)
+				{
+					testProcess.WaitForExit();
+					cargoExists = testProcess.ExitCode == 0;
+				}
+			}
+			catch
+			{
+				cargoExists = false;
+			}
+
+			if (!cargoExists)
+			{
+				AnsiConsole.MarkupLine("[red]Error: Cargo (Rust build tool) not found in PATH.[/]");
+				AnsiConsole.MarkupLine("[yellow]Please install Rust from https://rustup.rs/[/]");
+				return;
+			}
+
+			// Use the current Aggregator directory or try to find the directory containing Cargo.toml
+			string projectDir = Directory.GetCurrentDirectory();
+
+			// If there's no Cargo.toml in the current directory, check if we're in the bin folder
+			if (!File.Exists(Path.Combine(projectDir, "Cargo.toml")))
+			{
+				// Try the directory specified in the comment
+				projectDir = Path.GetFullPath("C:\\code\\SD\\SD_2025-TP\\TP2\\Aggregator");
+
+				if (!Directory.Exists(projectDir))
+				{
+					AnsiConsole.MarkupLine("[red]Could not find the Rust project directory.[/]");
+					return;
+				}
+			}
+
+			AnsiConsole.Status()
+				.Start("Starting Rust gRPC validation server...", ctx =>
+				{
+					ctx.Spinner(Spinner.Known.Dots);
+					ctx.SpinnerStyle(Style.Parse("green"));
+
+					Log($"Running cargo in directory: {projectDir}");
+
+					// Start the server using cargo run
+					var startInfo = new ProcessStartInfo
+					{
+						FileName = "cargo",
+						Arguments = "run",
+						UseShellExecute = true, // Use shell so we can open new console window
+						CreateNoWindow = false,
+						WindowStyle = ProcessWindowStyle.Normal,
+						WorkingDirectory = projectDir
+					};
+
+					grpcServerProcess = Process.Start(startInfo);
+
+					if (grpcServerProcess != null)
+					{
+						Log($"Rust gRPC server started with process ID: {grpcServerProcess.Id}");
+						Thread.Sleep(2000); // Give cargo some time to start
+					}
+					else
+					{
+						Log("Failed to start Rust gRPC server");
+					}
+				});
+
+			if (grpcServerProcess != null && !grpcServerProcess.HasExited)
+			{
+				AnsiConsole.MarkupLine("[green]Rust gRPC validation server started successfully.[/]");
+			}
+			else
+			{
+				AnsiConsole.MarkupLine("[red]Failed to start Rust gRPC validation server.[/]");
+			}
+		}
+		catch (Exception ex)
+		{
+			AnsiConsole.MarkupLine($"[red]Error starting Rust gRPC server: {ex.Message}[/]");
+		}
+		finally
+		{
+			inMenuMode = false;
+		}
+	}
+
+	/// <summary>
+	/// Kills the running Rust gRPC validation server
+	/// </summary>
+	private static void KillRustGrpcServer()
+	{
+		try
+		{
+			inMenuMode = true;
+
+			if (grpcServerProcess == null || grpcServerProcess.HasExited)
+			{
+				AnsiConsole.MarkupLine("[yellow]No Rust gRPC server is currently running.[/]");
+				return;
+			}
+
+			AnsiConsole.Status()
+				.Start("Stopping Rust gRPC validation server...", ctx =>
+				{
+					ctx.Spinner(Spinner.Known.Dots);
+					ctx.SpinnerStyle(Style.Parse("red"));
+
+					try
+					{
+						if (!grpcServerProcess.HasExited)
+						{
+							// Kill the entire process tree since cargo might have child processes
+							grpcServerProcess.Kill(true);
+							grpcServerProcess.WaitForExit(3000); // Wait up to 3 seconds
+
+							if (grpcServerProcess.HasExited)
+							{
+								Log("Successfully stopped Rust gRPC server");
+							}
+							else
+							{
+								Log("Failed to stop Rust gRPC server");
+							}
+						}
+					}
+					catch (Exception ex)
+					{
+						Log($"Error while stopping Rust gRPC server: {ex.Message}");
+					}
+				});
+
+			if (grpcServerProcess.HasExited)
+			{
+				AnsiConsole.MarkupLine("[green]Rust gRPC validation server stopped successfully.[/]");
+				grpcServerProcess = null;
+			}
+			else
+			{
+				AnsiConsole.MarkupLine("[red]Failed to stop Rust gRPC validation server.[/]");
+			}
+		}
+		catch (Exception ex)
+		{
+			AnsiConsole.MarkupLine($"[red]Error stopping Rust gRPC server: {ex.Message}[/]");
+		}
+		finally
+		{
+			inMenuMode = false;
+		}
+	}
 
 	/// <summary>
 	/// Sends a message with the specified code to the provided network stream

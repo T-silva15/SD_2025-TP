@@ -17,6 +17,12 @@ namespace OceanMonitorSystem
 		private readonly GrpcChannel _channel;
 		private readonly bool _verboseMode;
 
+		/// <summary>
+		/// Controls whether validation messages are displayed in the console
+		/// This is useful to prevent UI disruption during menu interactions
+		/// </summary>
+		public bool SuppressOutput { get; set; } = false;
+
 		// This will be initialized after the generated gRPC classes are available
 		private readonly dynamic _client;
 
@@ -36,7 +42,8 @@ namespace OceanMonitorSystem
 				MaxSendMessageSize = 4 * 1024 * 1024      // 4 MB
 			};
 
-			Console.WriteLine($"[VALIDATION] Initializing connection to validation service at {serverAddress}");
+			if (!SuppressOutput)
+				Console.WriteLine($"[VALIDATION] Initializing connection to validation service at {serverAddress}");
 
 			// Create the channel but defer actual client creation
 			_channel = GrpcChannel.ForAddress(serverAddress, channelOptions);
@@ -44,7 +51,8 @@ namespace OceanMonitorSystem
 			// Note: We'll handle the actual service connection dynamically
 			// to avoid the compile-time dependency on the generated classes
 
-			Console.WriteLine($"[VALIDATION] Channel created for validation service");
+			if (!SuppressOutput)
+				Console.WriteLine($"[VALIDATION] Channel created for validation service");
 		}
 
 		/// <summary>
@@ -57,12 +65,15 @@ namespace OceanMonitorSystem
 		{
 			try
 			{
-				Console.WriteLine("\n=== Data Validation Process ===");
-				Console.WriteLine($"Validating data for Wavy: {wavyId}");
-
-				if (_verboseMode)
+				if (!SuppressOutput)
 				{
-					Console.WriteLine($"Original data: {dataJson}");
+					Console.WriteLine("\n=== Data Validation Process ===");
+					Console.WriteLine($"Validating data for Wavy: {wavyId}");
+
+					if (_verboseMode)
+					{
+						Console.WriteLine($"Original data: {dataJson}");
+					}
 				}
 
 				// Parse the incoming JSON
@@ -73,7 +84,8 @@ namespace OceanMonitorSystem
 				if (!root.TryGetProperty("Data", out JsonElement dataArray) ||
 					dataArray.ValueKind != JsonValueKind.Array)
 				{
-					Console.WriteLine("[ERROR] Invalid data format: 'Data' array not found");
+					if (!SuppressOutput)
+						Console.WriteLine("[ERROR] Invalid data format: 'Data' array not found");
 					return (false, dataJson);
 				}
 
@@ -89,7 +101,8 @@ namespace OceanMonitorSystem
 						string dataType = dataTypeElement.GetString();
 						double value = valueElement.GetDouble();
 
-						Console.WriteLine($"→ Item {++itemCount}: {dataType} = {value}");
+						if (!SuppressOutput)
+							Console.WriteLine($"␦ Item {++itemCount}: {dataType} = {value}");
 
 						request.Data.Add(new DataItem
 						{
@@ -100,34 +113,48 @@ namespace OceanMonitorSystem
 					}
 				}
 
-				Console.WriteLine($"Sending {request.Data.Count} items to validation service...");
+				if (!SuppressOutput)
+					Console.WriteLine($"Sending {request.Data.Count} items to validation service...");
 
 				// Create the gRPC client and send request
 				var client = new DataValidationService.DataValidationServiceClient(_channel);
 				var response = await client.ValidateDataAsync(request);
 
 				// Process and display response information
-				Console.ForegroundColor = response.Status == ValidationResponse.Types.Status.Ok ?
-					ConsoleColor.Green :
-					(response.Status == ValidationResponse.Types.Status.PartiallyValid ? ConsoleColor.Yellow : ConsoleColor.Red);
+				if (!SuppressOutput)
+				{
+					Console.ForegroundColor = response.Status == ValidationResponse.Types.Status.Ok ?
+						ConsoleColor.Green :
+						(response.Status == ValidationResponse.Types.Status.PartiallyValid ? ConsoleColor.Yellow : ConsoleColor.Red);
 
-				Console.WriteLine($"Validation Status: {response.Status}");
-				Console.WriteLine($"Message: {response.Message}");
-				Console.ResetColor();
+					Console.WriteLine($"Validation Status: {response.Status}");
+					Console.WriteLine($"Message: {response.Message}");
+					Console.ResetColor();
+				}
 
 				// Check if validation failed entirely
 				if (response.Status == ValidationResponse.Types.Status.Invalid)
 				{
-					Console.WriteLine("[WARNING] Validation failed - cannot use this data");
+					if (!SuppressOutput)
+						Console.WriteLine("[WARNING] Validation failed - cannot use this data");
 					return (false, dataJson);
 				}
 
 				// Display detailed validation results
-				Console.WriteLine("\nValidation Results:");
+				if (!SuppressOutput)
+					Console.WriteLine("\nValidation Results:");
+
 				int modifiedCount = 0;
 
 				foreach (var item in response.Data)
 				{
+					if (SuppressOutput)
+					{
+						if (item.WasModified)
+							modifiedCount++;
+						continue;
+					}
+
 					string statusSymbol = item.WasModified ? "✓" : "✗";
 					ConsoleColor itemColor = item.WasModified ? ConsoleColor.Yellow : ConsoleColor.Green;
 
@@ -148,7 +175,8 @@ namespace OceanMonitorSystem
 				}
 
 				// Summary
-				Console.WriteLine($"\nSummary: {modifiedCount} of {response.Data.Count} items required cleaning");
+				if (!SuppressOutput)
+					Console.WriteLine($"\nSummary: {modifiedCount} of {response.Data.Count} items required cleaning");
 
 				// Reconstruct the data with cleaned values
 				var cleanedData = new
@@ -165,20 +193,25 @@ namespace OceanMonitorSystem
 
 				string cleanedJson = JsonSerializer.Serialize(cleanedData, new JsonSerializerOptions { WriteIndented = true });
 
-				if (_verboseMode)
+				if (!SuppressOutput && _verboseMode)
 				{
 					Console.WriteLine($"Cleaned data: {cleanedJson}");
 				}
 
-				Console.WriteLine("=== Validation Complete ===\n");
+				if (!SuppressOutput)
+					Console.WriteLine("=== Validation Complete ===\n");
+
 				return (true, cleanedJson);
 			}
 			catch (Exception ex)
 			{
-				Console.ForegroundColor = ConsoleColor.Red;
-				Console.WriteLine($"[VALIDATION ERROR] {ex.Message}");
-				Console.WriteLine($"Stack trace: {ex.StackTrace}");
-				Console.ResetColor();
+				if (!SuppressOutput)
+				{
+					Console.ForegroundColor = ConsoleColor.Red;
+					Console.WriteLine($"[VALIDATION ERROR] {ex.Message}");
+					Console.WriteLine($"Stack trace: {ex.StackTrace}");
+					Console.ResetColor();
+				}
 				return (false, dataJson);
 			}
 		}

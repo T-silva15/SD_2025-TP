@@ -1,11 +1,12 @@
-﻿using System;
+﻿using NetMQ;
+using NetMQ.Sockets;
+using Spectre.Console;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
 using System.Threading;
-using NetMQ;
-using NetMQ.Sockets;
 
 /// <summary>
 /// Edge component of the OceanMonitor system that generates sensor data and transmits it to the Aggregator
@@ -25,10 +26,10 @@ public class Wavy
 		public static string SubscriptionManagerAddress { get; set; } = "tcp://127.0.0.1:5557";
 
 		// Sensor simulation intervals
-		public static int TemperatureIntervalMs { get; private set; } = 6000;
-		public static int WindSpeedIntervalMs { get; private set; } = 3000;
-		public static int FrequencyIntervalMs { get; private set; } = 2000;
-		public static int DecibelsIntervalMs { get; private set; } = 1000;
+		public static int TemperatureIntervalMs { get; private set; } = 15000;
+		public static int WindSpeedIntervalMs { get; private set; } = 10000;
+		public static int FrequencyIntervalMs { get; private set; } = 7000;
+		public static int DecibelsIntervalMs { get; private set; } = 5000;
 
 		// Debug options
 		public static bool VerboseMode { get; set; } = false;
@@ -202,6 +203,84 @@ public class Wavy
 
 	#endregion
 
+	#region Logging System
+
+	// Log queue to store messages that will be displayed when not in menu mode
+	private static readonly ConcurrentQueue<string> logMessages = new ConcurrentQueue<string>();
+	private static bool inMenuMode = false;
+	private static Thread? logDisplayThread = null;
+
+	/// <summary>
+	/// Logs a message to the message queue for display
+	/// </summary>
+	private static void Log(string message, bool isVerbose = false)
+	{
+		if (isVerbose && !Config.VerboseMode)
+			return;
+
+		string formattedMessage = $"[{DateTime.Now:HH:mm:ss.fff}] {message}";
+		logMessages.Enqueue(formattedMessage);
+
+		// Only display immediately if not in menu mode
+		if (!inMenuMode && logDisplayThread == null)
+		{
+			AnsiConsole.MarkupLine($"[gray]{EscapeMarkup(formattedMessage)}[/]");
+		}
+	}
+
+	/// <summary>
+	/// Escapes markup characters in a string for Spectre.Console
+	/// </summary>
+	private static string EscapeMarkup(string text)
+	{
+		return text.Replace("[", "[[").Replace("]", "]]");
+	}
+
+	/// <summary>
+	/// Starts the log display thread that shows logs when not in menu mode
+	/// </summary>
+	private static void StartLogDisplayThread()
+	{
+		if (logDisplayThread != null)
+			return;
+
+		logDisplayThread = new Thread(() =>
+		{
+			try
+			{
+				while (isRunning)
+				{
+					if (!inMenuMode && logMessages.TryDequeue(out string? message))
+					{
+						// Use AnsiConsole for richer formatting
+						AnsiConsole.MarkupLine($"[gray]{EscapeMarkup(message)}[/]");
+					}
+					else
+					{
+						Thread.Sleep(100);
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				AnsiConsole.MarkupLine($"[red]Error in log display thread: {ex.Message}[/]");
+			}
+			finally
+			{
+				UnregisterThread(Thread.CurrentThread);
+			}
+		})
+		{
+			IsBackground = true,
+			Name = "LogDisplayThread"
+		};
+
+		RegisterThread(logDisplayThread);
+		logDisplayThread.Start();
+	}
+
+	#endregion
+
 	#region Entry Point and Main Thread Management
 
 	/// <summary>
@@ -212,8 +291,19 @@ public class Wavy
 	{
 		AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
 
+		AnsiConsole.Clear();
+
+		// Show a fancy title
+		AnsiConsole.Write(
+			new FigletText("Wavy")
+				.Color(Color.Blue)
+				.Centered());
+
+		AnsiConsole.Write(new Rule("[blue]Ocean Monitor System[/]").RuleStyle("grey").Centered());
+
 		ParseCommandLineArgs(args);
 		DisplayStartupInfo();
+		StartLogDisplayThread();
 		InitializeThreads();
 
 		// Keep main thread alive until shutdown
@@ -223,6 +313,28 @@ public class Wavy
 		}
 
 		ShutdownThreads();
+	}
+
+	/// <summary>
+	/// Displays startup information and available commands
+	/// </summary>
+	private static void DisplayStartupInfo()
+	{
+		var statusTable = new Table()
+			.Border(TableBorder.Rounded)
+			.BorderColor(Color.Grey)
+			.AddColumn(new TableColumn("[blue]Property[/]"))
+			.AddColumn(new TableColumn("[green]Value[/]"));
+
+		statusTable.AddRow("Wavy ID", $"[yellow]{wavyId}[/]");
+		statusTable.AddRow("Publisher Address", $"[yellow]{Config.PublisherAddress}[/]");
+		statusTable.AddRow("Subscription Manager", $"[yellow]{Config.SubscriptionManagerAddress}[/]");
+		statusTable.AddRow("Verbose Mode", Config.VerboseMode ? "[green]ON[/]" : "[grey]OFF[/]");
+
+		AnsiConsole.Write(statusTable);
+		AnsiConsole.WriteLine();
+
+		DisplayCommandMenu();
 	}
 
 	/// <summary>
@@ -262,27 +374,24 @@ public class Wavy
 	}
 
 	/// <summary>
-	/// Displays startup information and available commands
-	/// </summary>
-	private static void DisplayStartupInfo()
-	{
-		Console.WriteLine($"Wavy client starting (ID: {wavyId})");
-		Console.WriteLine($"Publishing on {Config.PublisherAddress}");
-		Console.WriteLine($"Subscription manager on {Config.SubscriptionManagerAddress}");
-		DisplayCommandMenu();
-	}
-
-	/// <summary>
-	/// Displays available commands in the console
+	/// Displays available commands in the console using Spectre.Console
 	/// </summary>
 	private static void DisplayCommandMenu()
 	{
-		Console.WriteLine("\nAvailable Commands:");
-		Console.WriteLine("Press 'V' to toggle verbose mode");
-		Console.WriteLine("Press 'T' to show active threads");
-		Console.WriteLine("Press 'S' to save current configuration");
-		Console.WriteLine("Press 'W' to clear screen");
-		Console.WriteLine("Press 'Q' to quit");
+		var table = new Table()
+			.BorderColor(Color.Grey)
+			.Title("[yellow]Available Commands[/]")
+			.AddColumn(new TableColumn("[aqua]Key[/]").Centered())
+			.AddColumn(new TableColumn("[green]Action[/]"));
+
+		table.AddRow("[yellow]V[/]", "Toggle verbose mode");
+		table.AddRow("[yellow]T[/]", "Show active threads");
+		table.AddRow("[yellow]S[/]", "Save current configuration");
+		table.AddRow("[yellow]X[/]", "Delete configuration files");
+		table.AddRow("[yellow]W[/]", "Clear screen");
+		table.AddRow("[yellow]Q[/]", "Quit");
+
+		AnsiConsole.Write(table);
 	}
 
 	/// <summary>
@@ -472,19 +581,19 @@ public class Wavy
 		{
 			case ConsoleKey.V:
 				Config.VerboseMode = !Config.VerboseMode;
-				Console.WriteLine($"Verbose mode: {(Config.VerboseMode ? "ON" : "OFF")}");
+				AnsiConsole.MarkupLine($"Verbose mode: {(Config.VerboseMode ? "[green]ON[/]" : "[grey]OFF[/]")}");
 				break;
 			case ConsoleKey.T:
 				ShowActiveThreads();
 				break;
 			case ConsoleKey.S:
-				Config.SaveToFile();
+				SaveConfigWithStatus();
 				break;
 			case ConsoleKey.X:
-				Config.DeleteConfigFile();
+				DeleteConfigWithStatus();
 				break;
 			case ConsoleKey.Q:
-				Console.WriteLine("Shutting down Wavy client...");
+				AnsiConsole.MarkupLine("[yellow]Shutting down Wavy client...[/]");
 				isRunning = false;
 				Thread.Sleep(500); // Give time for message to display
 				Environment.Exit(0);
@@ -492,40 +601,126 @@ public class Wavy
 			case ConsoleKey.W:
 				ClearScreenAndShowMenu();
 				break;
-
-			// debug functions
-			case ConsoleKey.F:
-				Console.WriteLine("Forcing default subscriptions...");
-				PubSubConfig.ForceAddDefaultSubscriptions();
-				break;
 		}
 	}
 
+	/// <summary>
+	/// Saves configuration with visual feedback
+	/// </summary>
+	private static void SaveConfigWithStatus()
+	{
+		try
+		{
+			inMenuMode = true;
+			AnsiConsole.Status()
+				.Start("Saving configuration...", ctx =>
+				{
+					ctx.Spinner(Spinner.Known.Dots);
+					ctx.SpinnerStyle(Style.Parse("green"));
+
+					// Save config
+					Config.SaveToFile();
+
+					Thread.Sleep(1000); // Show status for a moment
+				});
+
+			AnsiConsole.MarkupLine("[green]Configuration saved successfully.[/]");
+		}
+		finally
+		{
+			inMenuMode = false;
+		}
+	}
+
+	/// <summary>
+	/// Deletes configuration with visual feedback
+	/// </summary>
+	private static void DeleteConfigWithStatus()
+	{
+		try
+		{
+			inMenuMode = true;
+
+			if (AnsiConsole.Confirm("Are you sure you want to delete the configuration file?", false))
+			{
+				AnsiConsole.Status()
+					.Start("Deleting configuration...", ctx =>
+					{
+						ctx.Spinner(Spinner.Known.Dots);
+						ctx.SpinnerStyle(Style.Parse("yellow"));
+
+						// Delete config
+						Config.DeleteConfigFile();
+
+						Thread.Sleep(1000); // Show status for a moment
+					});
+
+				AnsiConsole.MarkupLine("[green]Configuration file deleted. Default settings will be used on restart.[/]");
+			}
+			else
+			{
+				AnsiConsole.MarkupLine("[yellow]Operation canceled.[/]");
+			}
+		}
+		finally
+		{
+			inMenuMode = false;
+		}
+	}
 
 	/// <summary>
 	/// Displays information about active threads and their runtime
 	/// </summary>
 	private static void ShowActiveThreads()
 	{
-		Console.WriteLine("\n=== Active Threads ===");
-		if (activeThreads.IsEmpty)
+		try
 		{
-			Console.WriteLine("No active threads.");
-		}
-		else
-		{
-			foreach (var threadEntry in activeThreads)
-			{
-				Thread thread = threadEntry.Key;
-				DateTime startTime = threadEntry.Value;
-				TimeSpan runningFor = DateTime.Now - startTime;
+			inMenuMode = true;
+			AnsiConsole.Clear();
 
-				Console.WriteLine($"Thread: {thread.Name ?? "Unnamed"}");
-				Console.WriteLine($"  ID: {thread.ManagedThreadId}, State: {thread.ThreadState}");
-				Console.WriteLine($"  Running for: {runningFor.Hours}h {runningFor.Minutes}m {runningFor.Seconds}s");
+			AnsiConsole.Write(new Rule("[yellow]Active Threads[/]").RuleStyle("blue").Centered());
+
+			if (activeThreads.IsEmpty)
+			{
+				AnsiConsole.MarkupLine("[grey]No active threads.[/]");
 			}
+			else
+			{
+				var table = new Table()
+					.BorderColor(Color.Blue)
+					.AddColumn(new TableColumn("[green]Thread Name[/]"))
+					.AddColumn(new TableColumn("[green]ID[/]").Centered())
+					.AddColumn(new TableColumn("[green]State[/]"))
+					.AddColumn(new TableColumn("[green]Running Time[/]"));
+
+				foreach (var threadEntry in activeThreads)
+				{
+					Thread thread = threadEntry.Key;
+					DateTime startTime = threadEntry.Value;
+					TimeSpan runningFor = DateTime.Now - startTime;
+
+					string state = thread.IsAlive ? "[green]Active[/]" : "[grey]Inactive[/]";
+					string runtime = $"{runningFor.Hours}h {runningFor.Minutes}m {runningFor.Seconds}s";
+
+					table.AddRow(
+						$"[yellow]{thread.Name ?? "Unnamed"}[/]",
+						$"[aqua]{thread.ManagedThreadId}[/]",
+						state,
+						runtime);
+				}
+
+				AnsiConsole.Write(table);
+			}
+
+			AnsiConsole.WriteLine();
+			AnsiConsole.Markup("[yellow]Press any key to return to main menu...[/]");
+			Console.ReadKey(true);
+			ClearScreenAndShowMenu();
 		}
-		Console.WriteLine("===================\n");
+		finally
+		{
+			inMenuMode = false;
+		}
 	}
 
 	/// <summary>
@@ -533,10 +728,31 @@ public class Wavy
 	/// </summary>
 	static void ClearScreenAndShowMenu()
 	{
-		Console.Clear();
-		Console.WriteLine($"Wavy client starting (ID: {wavyId})");
-		Console.WriteLine($"Publishing on {Config.PublisherAddress}");
-		Console.WriteLine($"Subscription manager on {Config.SubscriptionManagerAddress}");
+		AnsiConsole.Clear();
+
+		AnsiConsole.Write(
+			new FigletText("Wavy")
+				.Color(Color.Blue)
+				.Centered());
+
+		AnsiConsole.Write(new Rule("[blue]Ocean Monitor System[/]").RuleStyle("grey").Centered());
+
+		// Display key info in a status panel
+		var statusTable = new Table()
+			.Border(TableBorder.Rounded)
+			.BorderColor(Color.Grey)
+			.AddColumn(new TableColumn("[blue]Property[/]"))
+			.AddColumn(new TableColumn("[green]Value[/]"));
+
+		statusTable.AddRow("Wavy ID", $"[yellow]{wavyId}[/]");
+		statusTable.AddRow("Publisher Address", $"[yellow]{Config.PublisherAddress}[/]");
+		statusTable.AddRow("Subscription Manager", $"[yellow]{Config.SubscriptionManagerAddress}[/]");
+		statusTable.AddRow("Verbose Mode", Config.VerboseMode ? "[green]ON[/]" : "[grey]OFF[/]");
+		statusTable.AddRow("Active Subscriptions", $"[aqua]{PubSubConfig.SubscribedDataTypes.Count}[/] data types");
+
+		AnsiConsole.Write(statusTable);
+		AnsiConsole.WriteLine();
+
 		DisplayCommandMenu();
 	}
 
@@ -592,7 +808,7 @@ public class Wavy
 				// Log if verbose mode enabled
 				if (Config.VerboseMode)
 				{
-					Console.WriteLine($"Generated {dataType} sensor data: {value}");
+					Log($"Generated {dataType} sensor data: {value}", true);
 				}
 
 				// Wait for the next interval, checking isRunning periodically
@@ -604,7 +820,7 @@ public class Wavy
 		}
 		catch (Exception ex)
 		{
-			Console.WriteLine($"Error in {dataType} sensor thread: {ex.Message}");
+			Log($"Error in {dataType} sensor thread: {ex.Message}");
 		}
 		finally
 		{
@@ -649,10 +865,53 @@ public class Wavy
 					_publisherSocket = new PublisherSocket();
 					_publisherSocket.Options.SendHighWatermark = 1000;
 					_publisherSocket.Bind(Config.PublisherAddress);
-					Console.WriteLine($"Publisher socket bound to {Config.PublisherAddress}");
+					Log($"Publisher socket bound to {Config.PublisherAddress}");
 
 					// Allow time for subscribers to connect
 					Thread.Sleep(500);
+				}
+			}
+		}
+
+		/// <summary>
+		/// Initializes subscriptions - starts with an empty set. 
+		/// All subscriptions will be controlled by the Aggregator.
+		/// </summary>
+		public static void LoadSubscriptions()
+		{
+			try
+			{
+				// Initialize publisher socket first to prevent multiple binds
+				InitializePublisher();
+
+				// Start with no subscriptions - Aggregator will send subscription requests
+				SubscribedDataTypes.Clear();
+
+				Log("Subscription system initialized. Waiting for Aggregator subscription requests.");
+			}
+			catch (Exception ex)
+			{
+				Log($"Error initializing subscription system: {ex.Message}");
+			}
+		}
+
+		/// <summary>
+		/// Updates the list of subscribed data types based on Aggregator messages
+		/// </summary>
+		public static void UpdateSubscription(string dataType, bool isSubscribing)
+		{
+			if (isSubscribing)
+			{
+				if (SubscribedDataTypes.Add(dataType))
+				{
+					Log($"Added subscription for data type: {dataType}");
+				}
+			}
+			else
+			{
+				if (SubscribedDataTypes.Remove(dataType))
+				{
+					Log($"Removed subscription for data type: {dataType}");
 				}
 			}
 		}
@@ -672,39 +931,6 @@ public class Wavy
 					}
 					return _publisherSocket;
 				}
-			}
-		}
-
-		// DEBUG
-		public static void ForceAddDefaultSubscriptions()
-		{
-			// Add all available data types as subscribed
-			foreach (var dataType in AvailableDataTypes)
-			{
-				UpdateSubscription(dataType, true);
-				Console.WriteLine($"FORCE MODE: Added subscription for {dataType}");
-			}
-		}
-
-		/// <summary>
-		/// Initializes subscriptions - starts with an empty set. 
-		/// All subscriptions will be controlled by the Aggregator.
-		/// </summary>
-		public static void LoadSubscriptions()
-		{
-			try
-			{
-				// Initialize publisher socket first to prevent multiple binds
-				InitializePublisher();
-
-				// Start with no subscriptions - Aggregator will send subscription requests
-				SubscribedDataTypes.Clear();
-
-				Console.WriteLine("Subscription system initialized. Waiting for Aggregator subscription requests.");
-			}
-			catch (Exception ex)
-			{
-				Console.WriteLine($"Error initializing subscription system: {ex.Message}");
 			}
 		}
 
@@ -748,27 +974,6 @@ public class Wavy
 		}
 
 		/// <summary>
-		/// Updates the list of subscribed data types based on Aggregator messages
-		/// </summary>
-		public static void UpdateSubscription(string dataType, bool isSubscribing)
-		{
-			if (isSubscribing)
-			{
-				if (SubscribedDataTypes.Add(dataType))
-				{
-					Console.WriteLine($"Added subscription for data type: {dataType}");
-				}
-			}
-			else
-			{
-				if (SubscribedDataTypes.Remove(dataType))
-				{
-					Console.WriteLine($"Removed subscription for data type: {dataType}");
-				}
-			}
-		}
-
-		/// <summary>
 		/// Clean up ZeroMQ resources
 		/// </summary>
 		public static void Cleanup()
@@ -796,7 +1001,7 @@ public class Wavy
 				using (var responseSocket = new ResponseSocket())
 				{
 					responseSocket.Bind(Config.SubscriptionManagerAddress);
-					Console.WriteLine($"Subscription listener started on {Config.SubscriptionManagerAddress}");
+					Log($"Subscription listener started on {Config.SubscriptionManagerAddress}");
 
 					while (isRunning)
 					{
@@ -819,13 +1024,13 @@ public class Wavy
 									{
 										PubSubConfig.UpdateSubscription(dataType, true);
 										responseSocket.SendFrame("Subscribed");
-										Console.WriteLine($"Received subscription request for {dataType}");
+										Log($"Received subscription request for {dataType}");
 									}
 									else if (action == "unsubscribe")
 									{
 										PubSubConfig.UpdateSubscription(dataType, false);
 										responseSocket.SendFrame("Unsubscribed");
-										Console.WriteLine($"Received unsubscription request for {dataType}");
+										Log($"Received unsubscription request for {dataType}");
 									}
 									else
 									{
@@ -839,7 +1044,7 @@ public class Wavy
 							}
 							catch (Exception ex)
 							{
-								Console.WriteLine($"Error processing subscription request: {ex.Message}");
+								Log($"Error processing subscription request: {ex.Message}");
 								responseSocket.SendFrame("Error processing request");
 							}
 						}
@@ -847,7 +1052,7 @@ public class Wavy
 						{
 							if (isRunning) // Only log if not shutting down
 							{
-								Console.WriteLine($"Socket error: {ex.Message}");
+								Log($"Socket error: {ex.Message}");
 								Thread.Sleep(1000); // Avoid tight loop on error
 							}
 						}
@@ -856,7 +1061,7 @@ public class Wavy
 			}
 			catch (Exception ex)
 			{
-				Console.WriteLine($"Subscription listener error: {ex.Message}");
+				Log($"Subscription listener error: {ex.Message}");
 			}
 			finally
 			{
@@ -873,4 +1078,5 @@ public class Wavy
 	}
 
 	#endregion
+
 }
