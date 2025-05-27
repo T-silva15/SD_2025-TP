@@ -13,6 +13,8 @@ using System.Threading;
 using NetMQ;
 using NetMQ.Sockets;
 using Spectre.Console;
+using System.Xml;
+using System.Xml.Serialization;
 
 /// <summary>
 /// Middle-tier component of the OceanMonitor system that collects data from Wavy clients 
@@ -59,6 +61,9 @@ class Aggregator
 		public static int RetryIntervalSec { get; private set; } = 3;
 		public static int MaxRetryAttempts { get; private set; } = 5;
 		public static int ClientPollIntervalMs { get; private set; } = 100;
+
+		// Message format preference for sending data
+		public static string PreferredMessageFormat { get; set; } = "JSON";
 
 		// Buffer sizes
 		public static int ReceiveBufferSize { get; private set; } = 4096;
@@ -118,6 +123,9 @@ class Aggregator
 		/// </summary>
 		private static void ApplyConfigValues(Dictionary<string, object> config)
 		{
+			if (TryGetJsonValue(config, "PreferredMessageFormat", out JsonElement formatValue) && formatValue.ValueKind == JsonValueKind.String)
+				PreferredMessageFormat = formatValue.GetString() ?? "JSON";
+
 			if (TryGetJsonValue(config, "ServerIp", out JsonElement ipValue) && ipValue.ValueKind == JsonValueKind.String)
 				ServerIp = ipValue.GetString() ?? "127.0.0.1";
 
@@ -174,7 +182,8 @@ class Aggregator
 					{ "DataTransmissionIntervalSec", DataTransmissionIntervalSec },
 					{ "RetryIntervalSec", RetryIntervalSec },
 					{ "MaxRetryAttempts", MaxRetryAttempts },
-					{ "VerboseMode", VerboseMode }
+					{ "VerboseMode", VerboseMode },
+					{ "PreferredMessageFormat", PreferredMessageFormat }
 				};
 
 				string json = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
@@ -381,6 +390,7 @@ class Aggregator
 		table.AddRow("[yellow]D[/]", "Show current data store");
 		table.AddRow("[yellow]T[/]", "Show active threads");
 		table.AddRow("[yellow]M[/]", "Manage subscriptions");
+		table.AddRow("[yellow]F[/]", "Toggle message format (JSON/XML)");
 		table.AddRow("[yellow]S[/]", "Save current configuration");
 		table.AddRow("[yellow]X[/]", "Delete configuration and subscription files");
 		table.AddRow("[yellow]R[/]", "Run Rust gRPC validation server");
@@ -580,6 +590,10 @@ class Aggregator
 				break;
 			case ConsoleKey.R:
 				StartRustGrpcServer();
+				break;
+			case ConsoleKey.F:
+				Config.PreferredMessageFormat = Config.PreferredMessageFormat.ToUpperInvariant() == "JSON" ? "XML" : "JSON";
+				AnsiConsole.MarkupLine($"Message format switched to: [green]{Config.PreferredMessageFormat}[/]");
 				break;
 			case ConsoleKey.K:
 				KillRustGrpcServer();
@@ -1002,13 +1016,14 @@ class Aggregator
 		AnsiConsole.Write(new Rule("[blue]Ocean Monitor System[/]").RuleStyle("grey").Centered());
 
 		var statusTable = new Table()
-			.Border(TableBorder.Rounded)
-			.BorderColor(Color.Grey)
-			.AddColumn(new TableColumn("[blue]Property[/]"))
-			.AddColumn(new TableColumn("[green]Value[/]"));
+		.Border(TableBorder.Rounded)
+		.BorderColor(Color.Grey)
+		.AddColumn(new TableColumn("[blue]Property[/]"))
+		.AddColumn(new TableColumn("[green]Value[/]"));
 
 		statusTable.AddRow("Aggregator ID", $"[yellow]{aggregatorId}[/]");
 		statusTable.AddRow("Server Connection", $"[yellow]{Config.ServerIp}:{Config.ServerPort}[/]");
+		statusTable.AddRow("Message Format", $"[yellow]{Config.PreferredMessageFormat}[/]");
 		statusTable.AddRow("Verbose Mode", verboseMode ? "[green]ON[/]" : "[grey]OFF[/]");
 		statusTable.AddRow("Subscriptions", $"[aqua]{PubSubConfig.SubscribedDataTypes.Count}[/] data types");
 		statusTable.AddRow("Rust gRPC Server",
@@ -1025,6 +1040,151 @@ class Aggregator
 	#endregion
 
 	#region Data Processing and Server Communication
+
+	/// <summary>
+	/// Helper class for serialization and deserialization
+	/// </summary>
+	private static class SerializationHelper
+	{
+		/// <summary>
+		/// Detects message format and extracts content
+		/// </summary>
+		public static string DetectFormat(string message, out string content)
+		{
+			if (message.StartsWith("XML:"))
+			{
+				content = message.Substring(4); // Remove XML: prefix
+				return "XML";
+			}
+			else if (message.StartsWith("JSON:"))
+			{
+				content = message.Substring(5); // Remove JSON: prefix
+				return "JSON";
+			}
+			else
+			{
+				// Default to JSON if no prefix
+				content = message;
+				return "JSON";
+			}
+		}
+
+		/// <summary>
+		/// Serializes data according to specified format
+		/// </summary>
+		public static string Serialize(Dictionary<string, object> data, string format = "JSON")
+		{
+			return format.ToUpperInvariant() == "XML"
+				? SerializeToXml(data)
+				: SerializeToJson(data);
+		}
+
+		/// <summary>
+		/// Deserializes data from specified format
+		/// </summary>
+		public static Dictionary<string, object> Deserialize(string data, string format = "JSON")
+		{
+			return format.ToUpperInvariant() == "XML"
+				? DeserializeFromXml(data)
+				: DeserializeFromJson(data);
+		}
+
+		// JSON implementations
+		private static string SerializeToJson(Dictionary<string, object> data)
+		{
+			return JsonSerializer.Serialize(data);
+		}
+
+		private static Dictionary<string, object> DeserializeFromJson(string json)
+		{
+			try
+			{
+				return JsonSerializer.Deserialize<Dictionary<string, object>>(json);
+			}
+			catch (Exception ex)
+			{
+				Log($"JSON deserialization error: {ex.Message}", true);
+				return new Dictionary<string, object>();
+			}
+		}
+
+		// XML implementations
+		private static string SerializeToXml(Dictionary<string, object> data)
+		{
+			using var stringWriter = new StringWriter();
+			using var writer = XmlWriter.Create(stringWriter, new XmlWriterSettings { Indent = true });
+
+			writer.WriteStartDocument();
+
+			if (data.ContainsKey("action") && data.ContainsKey("dataType"))
+			{
+				// Subscription request format
+				writer.WriteStartElement("Request");
+				foreach (var pair in data)
+				{
+					writer.WriteElementString(pair.Key, pair.Value?.ToString());
+				}
+			}
+			else
+			{
+				// General data format
+				writer.WriteStartElement("Data");
+
+				if (data.TryGetValue("AggregatorId", out var aggregatorId))
+				{
+					writer.WriteAttributeString("AggregatorId", aggregatorId.ToString());
+				}
+
+				foreach (var pair in data)
+				{
+					if (pair.Key != "AggregatorId") // Skip AggregatorId as it's already an attribute
+					{
+						writer.WriteElementString(pair.Key, pair.Value?.ToString());
+					}
+				}
+			}
+
+			writer.WriteEndElement();
+			writer.WriteEndDocument();
+
+			return stringWriter.ToString();
+		}
+
+		private static Dictionary<string, object> DeserializeFromXml(string xml)
+		{
+			var result = new Dictionary<string, object>();
+
+			try
+			{
+				var doc = new XmlDocument();
+				doc.LoadXml(xml);
+
+				var root = doc.DocumentElement;
+				if (root == null) return result;
+
+				// Process attributes as key-value pairs
+				foreach (XmlAttribute attr in root.Attributes)
+				{
+					result[attr.Name] = attr.Value;
+				}
+
+				// Process child elements as key-value pairs
+				foreach (XmlNode node in root.ChildNodes)
+				{
+					if (node is XmlElement element)
+					{
+						result[element.Name] = element.InnerText;
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				Log($"XML deserialization error: {ex.Message}", true);
+			}
+
+			return result;
+		}
+	}
 
 	/// <summary>
 	/// Periodically sends aggregated data to the server based on configured interval
@@ -1477,7 +1637,20 @@ class Aggregator
 					StartSubscriptionListener(dataType, socket);
 				}
 
-				// ALWAYS notify the Wavy about this subscription with retries, even if already subscribed locally
+				// Create subscription message using preferred format
+				var subscriptionMessage = new Dictionary<string, object>
+		{
+			{ "action", "subscribe" },
+			{ "dataType", dataType }
+		};
+
+				// Serialize using preferred format
+				string format = Config.PreferredMessageFormat;
+				string serializedData = SerializationHelper.Serialize(subscriptionMessage, format);
+				string formatPrefix = format.ToUpperInvariant() == "XML" ? "XML:" : "JSON:";
+				string message = formatPrefix + serializedData;
+
+				// Notify the Wavy about this subscription with retries
 				Console.WriteLine($"{(alreadySubscribed ? "Re-sending" : "Sending")} subscription request for {dataType} to Wavy");
 
 				int maxRetries = 3;
@@ -1497,16 +1670,8 @@ class Aggregator
 							requestSocket.Connect(SubscriptionManagerAddress);
 							Console.WriteLine($"Connected to subscription manager");
 
-							// Prepare the subscription request
-							var request = new Dictionary<string, object>
-							{
-								{ "action", "subscribe" },
-								{ "dataType", dataType }
-							};
-							string json = JsonSerializer.Serialize(request);
-
-							Console.WriteLine($"Sending subscription request: {json}");
-							requestSocket.SendFrame(json);
+							Console.WriteLine($"Sending subscription request: {message}");
+							requestSocket.SendFrame(message);
 
 							Console.WriteLine($"Waiting for response...");
 
@@ -1515,7 +1680,22 @@ class Aggregator
 								// The socket will use its default timeout behavior
 								string response = requestSocket.ReceiveFrameString();
 								Console.WriteLine($"Subscription response: {response}");
-								requestSent = true;
+
+								// Detect format of response
+								string responseFormat = SerializationHelper.DetectFormat(response, out string responseContent);
+
+								// Check for success regardless of format
+								bool isSuccess = false;
+								if (responseFormat == "XML")
+								{
+									isSuccess = responseContent.Contains("Subscribed") || responseContent.Contains("<Response>Subscribed</Response>");
+								}
+								else
+								{
+									isSuccess = responseContent.Contains("Subscribed") || responseContent.Contains("\"status\":\"Subscribed\"");
+								}
+
+								requestSent = isSuccess;
 							}
 							catch (NetMQException ex)
 							{
@@ -1588,13 +1768,18 @@ class Aggregator
 					requestSocket.Connect(SubscriptionManagerAddress);
 
 					var request = new Dictionary<string, object>
-					{
-						{ "action", "unsubscribe" },
-						{ "dataType", dataType }
-					};
+			{
+				{ "action", "unsubscribe" },
+				{ "dataType", dataType }
+			};
 
-					string json = JsonSerializer.Serialize(request);
-					requestSocket.SendFrame(json);
+					// Use preferred format
+					string format = Config.PreferredMessageFormat;
+					string serializedData = SerializationHelper.Serialize(request, format);
+					string formatPrefix = format.ToUpperInvariant() == "XML" ? "XML:" : "JSON:";
+					string message = formatPrefix + serializedData;
+
+					requestSocket.SendFrame(message);
 
 					string response = requestSocket.ReceiveFrameString();
 					Console.WriteLine($"Unsubscription request response: {response}");
@@ -1627,18 +1812,22 @@ class Aggregator
 						try
 						{
 							string topic = socket.ReceiveFrameString();
-							string messageJson = socket.ReceiveFrameString();
+							string message = socket.ReceiveFrameString();
 
 							if (verboseMode)
 							{
-								Console.WriteLine($"Received {topic} data: {messageJson}");
+								Console.WriteLine($"Received {topic} data: {message}");
 							}
 
+							// Detect format and extract content
+							string format = SerializationHelper.DetectFormat(message, out string content);
+
+							// Deserialize using the detected format
+							var data = SerializationHelper.Deserialize(content, format);
+
 							// Process the received data
-							var data = JsonSerializer.Deserialize<Dictionary<string, object>>(messageJson);
 							if (data != null)
 							{
-								// Store the data
 								ProcessReceivedData(dataType, data);
 							}
 						}

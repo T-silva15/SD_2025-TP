@@ -7,6 +7,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text.Json;
 using System.Threading;
+using System.Xml;
+using System.Xml.Serialization;
 
 /// <summary>
 /// Edge component of the OceanMonitor system that generates sensor data and transmits it to the Aggregator
@@ -30,6 +32,9 @@ public class Wavy
 		public static int WindSpeedIntervalMs { get; private set; } = 10000;
 		public static int FrequencyIntervalMs { get; private set; } = 7000;
 		public static int DecibelsIntervalMs { get; private set; } = 5000;
+
+		// Message Format
+		public static string MessageFormat { get; set; } = "JSON"; // "JSON" or "XML"
 
 		// Debug options
 		public static bool VerboseMode { get; set; } = false;
@@ -84,6 +89,7 @@ public class Wavy
 			ExtractIntValue(config, "FrequencyIntervalMs", value => FrequencyIntervalMs = value);
 			ExtractIntValue(config, "DecibelsIntervalMs", value => DecibelsIntervalMs = value);
 			ExtractBoolValue(config, "VerboseMode", value => VerboseMode = value);
+			ExtractStringValue(config, "MessageFormat", value => MessageFormat = value);
 		}
 
 		/// <summary>
@@ -134,15 +140,16 @@ public class Wavy
 			try
 			{
 				var config = new Dictionary<string, object>
-				{
-					{ "PublisherAddress", PublisherAddress },
-					{ "SubscriptionManagerAddress", SubscriptionManagerAddress },
-					{ "TemperatureIntervalMs", TemperatureIntervalMs },
-					{ "WindSpeedIntervalMs", WindSpeedIntervalMs },
-					{ "FrequencyIntervalMs", FrequencyIntervalMs },
-					{ "DecibelsIntervalMs", DecibelsIntervalMs },
-					{ "VerboseMode", VerboseMode }
-				};
+			{
+				{ "PublisherAddress", PublisherAddress },
+				{ "SubscriptionManagerAddress", SubscriptionManagerAddress },
+				{ "TemperatureIntervalMs", TemperatureIntervalMs },
+				{ "WindSpeedIntervalMs", WindSpeedIntervalMs },
+				{ "FrequencyIntervalMs", FrequencyIntervalMs },
+				{ "DecibelsIntervalMs", DecibelsIntervalMs },
+				{ "VerboseMode", VerboseMode },
+				{ "MessageFormat", MessageFormat }
+			};
 
 				string json = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
 				File.WriteAllText(ConfigFilePath, json);
@@ -176,6 +183,132 @@ public class Wavy
 			{
 				Console.WriteLine($"Error deleting configuration file: {ex.Message}");
 			}
+		}
+	}
+
+	#endregion
+
+	#region Serialization
+
+	/// <summary>
+	/// Handles serialization and deserialization between different formats
+	/// </summary>
+	private static class SerializationHelper
+	{
+		/// <summary>
+		/// Serializes data to the currently selected format (JSON or XML)
+		/// </summary>
+		public static string Serialize(Dictionary<string, object> data)
+		{
+			return Config.MessageFormat.ToUpperInvariant() == "XML"
+				? SerializeToXml(data)
+				: SerializeToJson(data);
+		}
+
+		/// <summary>
+		/// Deserializes data from the specified format
+		/// </summary>
+		public static Dictionary<string, object> Deserialize(string data, string format = null)
+		{
+			format ??= Config.MessageFormat;
+
+			return format.ToUpperInvariant() == "XML"
+				? DeserializeFromXml(data)
+				: DeserializeFromJson(data);
+		}
+
+		/// <summary>
+		/// Serializes data to JSON
+		/// </summary>
+		private static string SerializeToJson(Dictionary<string, object> data)
+		{
+			return JsonSerializer.Serialize(data);
+		}
+
+		/// <summary>
+		/// Serializes data to XML
+		/// </summary>
+		private static string SerializeToXml(Dictionary<string, object> data)
+		{
+			using var stringWriter = new StringWriter();
+			using var writer = XmlWriter.Create(stringWriter, new XmlWriterSettings { Indent = true });
+
+			writer.WriteStartDocument();
+			writer.WriteStartElement("SensorData");
+
+			// Write WavyId as attribute
+			if (data.TryGetValue("WavyId", out var wavyId))
+			{
+				writer.WriteAttributeString("WavyId", wavyId.ToString());
+			}
+
+			// Write all other elements
+			foreach (var pair in data)
+			{
+				if (pair.Key != "WavyId") // Skip WavyId as it's already an attribute
+				{
+					writer.WriteElementString(pair.Key, pair.Value?.ToString());
+				}
+			}
+
+			writer.WriteEndElement(); // SensorData
+			writer.WriteEndDocument();
+
+			return stringWriter.ToString();
+		}
+
+		/// <summary>
+		/// Deserializes from JSON format
+		/// </summary>
+		private static Dictionary<string, object> DeserializeFromJson(string json)
+		{
+			try
+			{
+				return JsonSerializer.Deserialize<Dictionary<string, object>>(json);
+			}
+			catch (Exception ex)
+			{
+				Log($"JSON deserialization error: {ex.Message}", true);
+				return new Dictionary<string, object>();
+			}
+		}
+
+		/// <summary>
+		/// Deserializes from XML format
+		/// </summary>
+		private static Dictionary<string, object> DeserializeFromXml(string xml)
+		{
+			var result = new Dictionary<string, object>();
+
+			try
+			{
+				var doc = new XmlDocument();
+				doc.LoadXml(xml);
+
+				var root = doc.DocumentElement;
+				if (root == null) return result;
+
+				// Get WavyId from attribute
+				if (root.HasAttribute("WavyId"))
+				{
+					result["WavyId"] = root.GetAttribute("WavyId");
+				}
+
+				// Get child elements
+				foreach (XmlNode node in root.ChildNodes)
+				{
+					if (node is XmlElement element)
+					{
+						result[element.Name] = element.InnerText;
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				Log($"XML deserialization error: {ex.Message}", true);
+			}
+
+			return result;
 		}
 	}
 
@@ -386,6 +519,7 @@ public class Wavy
 
 		table.AddRow("[yellow]V[/]", "Toggle verbose mode");
 		table.AddRow("[yellow]T[/]", "Show active threads");
+		table.AddRow("[yellow]F[/]", "Toggle message format (JSON/XML)");
 		table.AddRow("[yellow]S[/]", "Save current configuration");
 		table.AddRow("[yellow]X[/]", "Delete configuration files");
 		table.AddRow("[yellow]W[/]", "Clear screen");
@@ -583,6 +717,10 @@ public class Wavy
 				Config.VerboseMode = !Config.VerboseMode;
 				AnsiConsole.MarkupLine($"Verbose mode: {(Config.VerboseMode ? "[green]ON[/]" : "[grey]OFF[/]")}");
 				break;
+			case ConsoleKey.F:
+				Config.MessageFormat = Config.MessageFormat.ToUpperInvariant() == "JSON" ? "XML" : "JSON";
+				AnsiConsole.MarkupLine($"Message format switched to: [green]{Config.MessageFormat}[/]");
+				break;
 			case ConsoleKey.T:
 				ShowActiveThreads();
 				break;
@@ -595,7 +733,7 @@ public class Wavy
 			case ConsoleKey.Q:
 				AnsiConsole.MarkupLine("[yellow]Shutting down Wavy client...[/]");
 				isRunning = false;
-				Thread.Sleep(500); // Give time for message to display
+				Thread.Sleep(500);
 				Environment.Exit(0);
 				break;
 			case ConsoleKey.W:
@@ -747,6 +885,7 @@ public class Wavy
 		statusTable.AddRow("Wavy ID", $"[yellow]{wavyId}[/]");
 		statusTable.AddRow("Publisher Address", $"[yellow]{Config.PublisherAddress}[/]");
 		statusTable.AddRow("Subscription Manager", $"[yellow]{Config.SubscriptionManagerAddress}[/]");
+		statusTable.AddRow("Message Format", $"[yellow]{Config.MessageFormat}[/]");
 		statusTable.AddRow("Verbose Mode", Config.VerboseMode ? "[green]ON[/]" : "[grey]OFF[/]");
 		statusTable.AddRow("Active Subscriptions", $"[aqua]{PubSubConfig.SubscribedDataTypes.Count}[/] data types");
 
@@ -941,35 +1080,42 @@ public class Wavy
 		{
 			if (data == null) return;
 
-			string dataType = data["DataType"].ToString();
+			string? dataType = data["DataType"]?.ToString();
+			if (dataType == null) return;
 
 			// Only publish if this data type has subscribers
 			if (SubscribedDataTypes.Contains(dataType))
 			{
 				try
 				{
-					// Add topic (data type) and serialized message
-					string json = JsonSerializer.Serialize(data);
+					// Get message format indicator
+					string formatIndicator = Config.MessageFormat.ToUpperInvariant() == "XML" ? "XML:" : "JSON:";
+
+					// Serialize the data according to current format
+					string serializedData = SerializationHelper.Serialize(data);
+
+					// Prepend with format indicator
+					string message = formatIndicator + serializedData;
 
 					lock (_socketLock)
 					{
 						// ZeroMQ multipart message: first frame is topic, second is data
-						PublisherSocket.SendMoreFrame(dataType).SendFrame(json);
+						PublisherSocket.SendMoreFrame(dataType).SendFrame(message);
 					}
 
 					if (Config.VerboseMode)
 					{
-						Console.WriteLine($"Published {dataType} data: {json}");
+						Log($"Published {dataType} data with format {Config.MessageFormat}: {serializedData}", true);
 					}
 				}
 				catch (Exception ex)
 				{
-					Console.WriteLine($"Error publishing {dataType} data: {ex.Message}");
+					Log($"Error publishing {dataType} data: {ex.Message}");
 				}
 			}
 			else if (Config.VerboseMode)
 			{
-				Console.WriteLine($"Skipped publishing {dataType} - no subscribers");
+				Log($"Skipped publishing {dataType} - no subscribers", true);
 			}
 		}
 
@@ -1010,9 +1156,23 @@ public class Wavy
 							// This will block until a message is received
 							string message = responseSocket.ReceiveFrameString();
 
+							// Detect format (JSON or XML)
+							string format = "JSON"; // Default
+							if (message.StartsWith("XML:"))
+							{
+								format = "XML";
+								message = message.Substring(4); // Remove format indicator
+							}
+							else if (message.StartsWith("JSON:"))
+							{
+								message = message.Substring(5); // Remove format indicator
+							}
+
 							try
 							{
-								var request = JsonSerializer.Deserialize<Dictionary<string, object>>(message);
+								// Use the appropriate deserialization method based on format
+								var request = SerializationHelper.Deserialize(message, format);
+
 								if (request != null &&
 									request.TryGetValue("action", out object actionObj) &&
 									request.TryGetValue("dataType", out object dataTypeObj))
@@ -1023,37 +1183,85 @@ public class Wavy
 									if (action == "subscribe")
 									{
 										PubSubConfig.UpdateSubscription(dataType, true);
-										responseSocket.SendFrame("Subscribed");
-										Log($"Received subscription request for {dataType}");
+
+										// Send response in the same format as the request
+										string responseFormat = format.ToUpperInvariant() == "XML" ? "XML" : "JSON";
+										string formatIndicator = responseFormat == "XML" ? "XML:" : "JSON:";
+
+										if (responseFormat == "XML")
+										{
+											responseSocket.SendFrame(formatIndicator + "<Response>Subscribed</Response>");
+										}
+										else
+										{
+											responseSocket.SendFrame(formatIndicator + "{\"status\":\"Subscribed\"}");
+										}
+
+										Log($"Received subscription request for {dataType} (format: {format})");
 									}
 									else if (action == "unsubscribe")
 									{
 										PubSubConfig.UpdateSubscription(dataType, false);
-										responseSocket.SendFrame("Unsubscribed");
-										Log($"Received unsubscription request for {dataType}");
+
+										// Send response in the same format as the request
+										string responseFormat = format.ToUpperInvariant() == "XML" ? "XML" : "JSON";
+										string formatIndicator = responseFormat == "XML" ? "XML:" : "JSON:";
+
+										if (responseFormat == "XML")
+										{
+											responseSocket.SendFrame(formatIndicator + "<Response>Subscribed</Response>");
+										}
+										else
+										{
+											responseSocket.SendFrame(formatIndicator + "{\"status\":\"Subscribed\"}");
+										}
+
+										Log($"Received unsubscription request for {dataType} (format: {format})");
 									}
 									else
 									{
-										responseSocket.SendFrame("Unknown action");
+										if (format.ToUpperInvariant() == "XML")
+										{
+											responseSocket.SendFrame("XML:<Response>Unknown action</Response>");
+										}
+										else
+										{
+											responseSocket.SendFrame("JSON:{\"error\":\"Unknown action\"}");
+										}
 									}
 								}
 								else
 								{
-									responseSocket.SendFrame("Invalid request format");
+									if (format.ToUpperInvariant() == "XML")
+									{
+										responseSocket.SendFrame("XML:<Response>Invalid request format</Response>");
+									}
+									else
+									{
+										responseSocket.SendFrame("JSON:{\"error\":\"Invalid request format\"}");
+									}
 								}
 							}
 							catch (Exception ex)
 							{
 								Log($"Error processing subscription request: {ex.Message}");
-								responseSocket.SendFrame("Error processing request");
+
+								if (format.ToUpperInvariant() == "XML")
+								{
+									responseSocket.SendFrame($"XML:<Error>Error processing request: {ex.Message}</Error>");
+								}
+								else
+								{
+									responseSocket.SendFrame($"JSON:{{\"error\":\"Error processing request: {ex.Message}\"}}");
+								}
 							}
 						}
 						catch (Exception ex)
 						{
-							if (isRunning) // Only log if not shutting down
+							if (isRunning)
 							{
 								Log($"Socket error: {ex.Message}");
-								Thread.Sleep(1000); // Avoid tight loop on error
+								Thread.Sleep(1000); 
 							}
 						}
 					}
