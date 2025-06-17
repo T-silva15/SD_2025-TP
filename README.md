@@ -9,7 +9,7 @@
 [![SQL Server](https://img.shields.io/badge/SQL%20Server-2022-red.svg)](https://www.microsoft.com/sql-server)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> **Academic Project** | Distributed Systems | **Final Grade: TBD** 🏆
+> **Academic Project** | Distributed Systems | **Final Grade: 20/20** 🏆
 
 A scalable distributed system for collecting, aggregating, and analyzing ocean sensor data across multiple tiers using socket communication, ZeroMQ messaging, Rust microservices, and gRPC for advanced data processing.
 
